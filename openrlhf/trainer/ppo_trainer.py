@@ -114,11 +114,13 @@ class BasePPOTrainer(ABC):
 
         # Peek at the first decoded sample for quick sanity check.
         _decode = self.tokenizer.decode if _TRANSFORMERS_V5 else self.tokenizer.batch_decode
-        sample0 = [
-            _decode(experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True)[0],
-            experiences[0].info["reward"][0].item(),
-        ]
-        print(sample0)
+        _sample0_text = _decode(experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True)[0]
+        _sample0_reward = experiences[0].info["reward"][0].item()
+        print("=" * 60)
+        print(f"[Sample 0] reward={_sample0_reward}")
+        print("-" * 60)
+        print(_sample0_text)
+        print("=" * 60)
 
         # Balance experiences across DP ranks if needed.
         if self.args.use_dynamic_batch:
