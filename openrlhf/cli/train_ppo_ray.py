@@ -553,8 +553,8 @@ if __name__ == "__main__":
     if args.async_train:
         assert not args.vllm_enable_sleep, "Async RLHF is not supported with --vllm_enable_sleep."
 
-    if args.eval_dataset:
-        assert args.remote_rm_url, "`--eval_dataset` is only supported with `--remote_rm_url`."
+    if args.eval_dataset and not args.agent_func_path:
+        assert args.remote_rm_url, "`--eval_dataset` is only supported with `--remote_rm_url` or `--agent_func_path`."
 
     if args.use_kl_loss:
         if args.kl_estimator not in ["k2", "k3"]:
