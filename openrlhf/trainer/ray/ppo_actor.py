@@ -347,8 +347,8 @@ class ActorPPOTrainer(ABC):
 
         hook_handles = []
         hook_handles.append(action_log_probs.register_hook(lambda g: _check_grad(g, "action_log_probs")))
-        if hasattr(output, "logits") and output.logits is not None and output.logits.requires_grad:
-            hook_handles.append(output.logits.register_hook(lambda g: _check_grad(g, "output_logits")))
+        # NOTE: Do NOT hook output.logits — its gradient is (1, seq_len, vocab=151936) in fp32,
+        # ~12 GB that causes OOM when materialized for the hook.
 
         self.strategy.backward(loss, self.actor, self.actor_optim)
 
@@ -359,25 +359,13 @@ class ActorPPOTrainer(ABC):
         # Report gradient NaN findings
         if _grad_nan_info:
             parts = [f"  - {name}: {info}" for name, info in _grad_nan_info.items()]
-            if "action_log_probs" in _grad_nan_info and "output_logits" in _grad_nan_info:
-                source = "NaN originates in the PPO loss computation (before log_probs)."
-            elif "output_logits" in _grad_nan_info:
-                source = "NaN originates in log_probs_from_logits backward (fp32 computation)."
-            elif "action_log_probs" in _grad_nan_info:
-                source = "NaN in action_log_probs grad but NOT in logits grad — check masking/slicing."
-            else:
-                source = "NaN detected at unexpected point."
             raise RuntimeError(
                 f"[Actor training_step {step}] NaN/Inf gradient detected during backward!\n"
                 + "\n".join(parts) + "\n"
-                f"  Diagnosis: {source}\n"
+                f"  Diagnosis: NaN in action_log_probs gradient means the PPO loss computation "
+                f"produced NaN/Inf before gradients entered the model backward.\n"
                 f"  loss={loss.item()}, actor_loss={actor_loss.item()}"
             )
-        else:
-            # Hooks were clean — if NaN appears in weights after optimizer step,
-            # it means the NaN originates INSIDE the model backward pass (bf16 numerics,
-            # e.g. flash attention backward or layer norm backward).
-            logger.info(f"[Step {step}] Gradient hooks clean — no NaN at loss→model boundary.")
 
         # NaN diagnostic: check gradients after backward (before optimizer step)
         do_step = (not self.args.use_dynamic_batch) or self.replay_buffer.dynamic_optimizer_step[step]
