@@ -226,6 +226,30 @@ class ActorPPOTrainer(ABC):
         advantages = experience.advantages
         base_action_log_probs = experience.base_action_log_probs
 
+        # NaN detection: check if experience data is already corrupted
+        nan_diagnostics = []
+        if old_action_log_probs is not None and torch.isnan(old_action_log_probs).any():
+            nan_diagnostics.append(
+                f"old_action_log_probs has {torch.isnan(old_action_log_probs).sum().item()} NaN values "
+                f"out of {old_action_log_probs.numel()} (shape={list(old_action_log_probs.shape)})"
+            )
+        if base_action_log_probs is not None and torch.isnan(base_action_log_probs).any():
+            nan_diagnostics.append(
+                f"base_action_log_probs has {torch.isnan(base_action_log_probs).sum().item()} NaN values "
+                f"out of {base_action_log_probs.numel()} (shape={list(base_action_log_probs.shape)})"
+            )
+        if advantages is not None and torch.isnan(advantages).any():
+            nan_diagnostics.append(
+                f"advantages has {torch.isnan(advantages).sum().item()} NaN values "
+                f"out of {advantages.numel()} (shape={list(advantages.shape)})"
+            )
+        if nan_diagnostics:
+            raise RuntimeError(
+                f"[Actor training_step {step}] NaN detected in experience inputs — "
+                f"model weights are likely corrupted from a previous optimizer step.\n"
+                + "\n".join(f"  - {d}" for d in nan_diagnostics)
+            )
+
         # actor loss
         action_log_probs, output = self.actor(
             sequences,
@@ -280,6 +304,28 @@ class ActorPPOTrainer(ABC):
 
         if self.args.use_dynamic_batch:
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
+
+        # NaN detection: check loss before backward to prevent weight corruption
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            nan_parts = []
+            if torch.isnan(actor_loss) or torch.isinf(actor_loss):
+                nan_parts.append(f"actor_loss={actor_loss.item()}")
+            if isinstance(kl_loss, torch.Tensor) and (torch.isnan(kl_loss) or torch.isinf(kl_loss)):
+                nan_parts.append(f"kl_loss={kl_loss.item()}")
+            if self.args.entropy_loss_coef is not None and (torch.isnan(entropy_loss) or torch.isinf(entropy_loss)):
+                nan_parts.append(f"entropy_loss={entropy_loss.item()}")
+            # Check if action_log_probs from the current forward pass are NaN
+            if torch.isnan(action_log_probs).any():
+                nan_parts.append(
+                    f"action_log_probs has {torch.isnan(action_log_probs).sum().item()} NaN values — "
+                    f"actor model forward pass is producing NaN logits"
+                )
+            raise RuntimeError(
+                f"[Actor training_step {step}] NaN/Inf loss detected (loss={loss.item()}).\n"
+                f"  Breakdown: {', '.join(nan_parts) if nan_parts else 'unknown source'}\n"
+                f"  seq_len={sequences.shape}, action_mask_sum={action_mask.sum().item()}, "
+                f"  advantages range=[{advantages.min().item():.4f}, {advantages.max().item():.4f}]"
+            )
 
         self.strategy.backward(loss, self.actor, self.actor_optim)
         if self.args.use_dynamic_batch:

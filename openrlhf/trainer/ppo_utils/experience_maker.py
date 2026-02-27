@@ -653,6 +653,16 @@ class RemoteExperienceMaker:
             len(samples_list) == len(action_log_probs_list) == len(base_action_log_probs_list) == len(value_list)
         ), f"len(samples_list): {len(samples_list)}, len(action_log_probs_list): {len(action_log_probs_list)}, len(base_action_log_probs_list): {len(base_action_log_probs_list)}, len(value_list): {len(value_list)}"
 
+        # NaN detection: check actor model's action_log_probs for corruption
+        for i, alp in enumerate(action_log_probs_list):
+            if alp is not None and torch.isnan(alp).any():
+                nan_count = torch.isnan(alp).sum().item()
+                raise RuntimeError(
+                    f"[make_experience] NaN detected in action_log_probs for sample {i} "
+                    f"({nan_count}/{alp.numel()} values are NaN, shape={list(alp.shape)}). "
+                    f"The actor model's weights are likely corrupted from a previous optimizer step."
+                )
+
         # Process results for each sample
         for i, (samples, action_log_probs, base_action_log_probs, value) in enumerate(
             zip(samples_list, action_log_probs_list, base_action_log_probs_list, value_list)
