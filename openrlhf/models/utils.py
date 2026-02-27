@@ -84,7 +84,7 @@ def _logsumexp_by_chunk(logits: torch.Tensor, chunk_size: int = 1024) -> torch.T
 
 def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     if temperature != 1.0:
-        logits = logits / temperature  # avoid in-place op on tensors in the autograd graph
+        logits.div_(temperature)
     # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
     if logits.dtype in [torch.float32, torch.float64]:
         batch_dim = logits.shape[:-1]
