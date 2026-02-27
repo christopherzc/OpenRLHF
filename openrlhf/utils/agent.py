@@ -29,9 +29,10 @@ class AgentInstanceBase(ABC):
 
 
 class MultiTurnAgentExecutor(AgentExecutorBase):
-    def __init__(self, agent_instance_cls):
+    def __init__(self, agent_instance_cls, verl_agent_format: bool = False):
         assert issubclass(agent_instance_cls, AgentInstanceBase), "AgentInstance must inherit from AgentInstanceBase"
         self.agent_instance_cls = agent_instance_cls
+        self.verl_agent_format = verl_agent_format
 
     async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine):
         # Treat each AgentInstance as an isolated environment; bind every prompt to its own independent instance
@@ -59,6 +60,19 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             # Also update observation_text to match truncated tokens
             observation_text = hf_tokenizer.decode(current_obs_tokens, skip_special_tokens=False)
 
+        # In verl_agent_format mode, the model sees a fresh prompt each turn
+        # (like verl-agent's build_text_obs()), but the training sequence still
+        # concatenates everything with proper ChatML turn boundaries.
+        # inference_tokens: what vllm sees (rebuilt each turn)
+        # training_tokens: the full concatenated sequence (for PPO training)
+        if self.verl_agent_format:
+            inference_tokens = list(current_obs_tokens)
+            training_tokens = list(current_obs_tokens)
+            turn_boundary = "<|im_end|>\n"
+            turn_boundary_tokens = hf_tokenizer(
+                turn_boundary, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"][0].tolist()
+
         # Initialize tracking variables
         action_ranges = []
         total_reward = 0
@@ -72,19 +86,26 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
 
         # Execute multiple steps of interaction
         while True:
-            # Next sampling budget
-            sampling_params.max_tokens = max_length - len(current_obs_tokens)
+            if self.verl_agent_format:
+                # Budget based on fresh inference prompt
+                sampling_params.max_tokens = max_length - len(inference_tokens)
+            else:
+                sampling_params.max_tokens = max_length - len(current_obs_tokens)
             # No budget to generate, break
             if sampling_params.max_tokens <= 0:
                 break
 
             # Generate response asynchronously (input and output are token ids)
-            request_output = await llm_engine.generate(current_obs_tokens, deepcopy(sampling_params))
+            gen_input = inference_tokens if self.verl_agent_format else current_obs_tokens
+            request_output = await llm_engine.generate(gen_input, deepcopy(sampling_params))
             action_tokens = request_output.outputs[0].token_ids
             action_text = request_output.outputs[0].text
 
-            # Record action range in token space
-            action_start = len(current_obs_tokens)
+            # Record action range in token space (always relative to training sequence)
+            if self.verl_agent_format:
+                action_start = len(training_tokens)
+            else:
+                action_start = len(current_obs_tokens)
             action_end = action_start + len(action_tokens)
             action_ranges.append((action_start, action_end))
 
@@ -103,23 +124,47 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             done = step_result["done"]
             extra_logs = step_result.get("extra_logs", {})
 
-            # Concatenate observation, action, and environment_feedback, then tokenize
-            observation_text = observation_text + action_text + environment_feedback_text
-            current_obs_tokens = (
-                current_obs_tokens
-                + action_tokens
-                + hf_tokenizer(environment_feedback_text, add_special_tokens=False, return_tensors="pt")["input_ids"][
-                    0
-                ].tolist()
-            )
+            if self.verl_agent_format:
+                env_feedback_tokens = (
+                    hf_tokenizer(environment_feedback_text, add_special_tokens=False, return_tensors="pt")[
+                        "input_ids"
+                    ][0].tolist()
+                    if environment_feedback_text
+                    else []
+                )
 
-            # Calculate rollout log probs
-            if sampling_params.logprobs is not None:
-                # action tokens logprobs
-                for i, logprob in enumerate(request_output.outputs[0].logprobs):
-                    rollout_log_probs.append(logprob[action_tokens[i]].logprob)
-                # dummy logprobs for the env feedback tokens
-                rollout_log_probs.extend([0.0] * (len(current_obs_tokens) - len(rollout_log_probs)))
+                # Training sequence: concatenate with <|im_end|>\n between turns
+                if environment_feedback_text:
+                    training_tokens = training_tokens + action_tokens + turn_boundary_tokens + env_feedback_tokens
+                    observation_text = observation_text + action_text + turn_boundary + environment_feedback_text
+                else:
+                    training_tokens = training_tokens + action_tokens
+                    observation_text = observation_text + action_text
+
+                # Inference: model sees only the fresh prompt next turn
+                inference_tokens = env_feedback_tokens if environment_feedback_text else []
+
+                # Logprobs tracking uses training sequence length
+                if sampling_params.logprobs is not None:
+                    for i, logprob in enumerate(request_output.outputs[0].logprobs):
+                        rollout_log_probs.append(logprob[action_tokens[i]].logprob)
+                    rollout_log_probs.extend([0.0] * (len(training_tokens) - len(rollout_log_probs)))
+            else:
+                # Original concatenation behavior
+                observation_text = observation_text + action_text + environment_feedback_text
+                current_obs_tokens = (
+                    current_obs_tokens
+                    + action_tokens
+                    + hf_tokenizer(environment_feedback_text, add_special_tokens=False, return_tensors="pt")[
+                        "input_ids"
+                    ][0].tolist()
+                )
+
+                # Calculate rollout log probs
+                if sampling_params.logprobs is not None:
+                    for i, logprob in enumerate(request_output.outputs[0].logprobs):
+                        rollout_log_probs.append(logprob[action_tokens[i]].logprob)
+                    rollout_log_probs.extend([0.0] * (len(current_obs_tokens) - len(rollout_log_probs)))
 
             # Get sampling params from the environment step
             if step_result.get("sampling_params", None):
@@ -134,7 +179,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             "label": label,
             "reward": total_reward,
             "scores": final_scores,
-            "observation_tokens": current_obs_tokens,
+            "observation_tokens": training_tokens if self.verl_agent_format else current_obs_tokens,
             "action_ranges": action_ranges,
             "rollout_log_probs": rollout_log_probs,
             "extra_logs": extra_logs,

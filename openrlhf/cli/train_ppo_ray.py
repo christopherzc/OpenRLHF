@@ -67,6 +67,7 @@ def train(args):
             "processed_logprobs" if args.enable_vllm_is_correction else None,
             agent_func_path=args.agent_func_path,
             remote_rm_url=args.remote_rm_url,
+            verl_agent_format=args.verl_agent_format,
         )
 
     actor_model = RayActorGroup(
@@ -439,6 +440,14 @@ if __name__ == "__main__":
     parser.add_argument("--value_head_prefix", type=str, default="score")
     parser.add_argument("--ref_reward_offload", action="store_true", default=False)
     parser.add_argument("--agent_func_path", type=str, default=None, help="Agent script path")
+    parser.add_argument(
+        "--verl_agent_format",
+        action="store_true",
+        default=False,
+        help="Use verl-agent-style prompt rebuilding: the model sees a fresh prompt each turn "
+        "instead of the growing concatenated history. The training sequence still concatenates "
+        "all turns with proper ChatML boundaries for PPO.",
+    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")

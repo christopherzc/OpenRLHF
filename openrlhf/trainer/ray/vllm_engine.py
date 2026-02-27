@@ -16,7 +16,7 @@ from openrlhf.utils.agent import AgentExecutorBase, SingleTurnAgentExecutor
 from .utils import get_bundle_indices, ray_noset_visible_devices
 
 
-def _load_agent_executor(agent_func_path: str) -> AgentExecutorBase:
+def _load_agent_executor(agent_func_path: str, verl_agent_format: bool = False) -> AgentExecutorBase:
     assert agent_func_path.endswith(".py"), "Agent path must be a Python file"
     import importlib.util
 
@@ -27,7 +27,9 @@ def _load_agent_executor(agent_func_path: str) -> AgentExecutorBase:
     assert hasattr(agent_module, "AgentExecutor"), "Agent module must contain AgentExecutor class"
     agent_executor_cls = agent_module.AgentExecutor
     assert issubclass(agent_executor_cls, AgentExecutorBase), "AgentExecutor must inherit from AgentExecutorBase"
-    return agent_executor_cls()
+    executor = agent_executor_cls()
+    executor.verl_agent_format = verl_agent_format
+    return executor
 
 
 @ray.remote
@@ -40,6 +42,7 @@ class LLMRayActor:
         bundle_indices: list = None,
         agent_func_path: Optional[str] = None,
         remote_rm_url: Optional[str] = None,
+        verl_agent_format: bool = False,
         **kwargs,
     ):
         self._configure_device_env(
@@ -53,7 +56,7 @@ class LLMRayActor:
         # - custom agent executor: user-provided AgentExecutorBase subclass
         # - single-turn with optional reward: default executor
         if agent_func_path:
-            self.executor = _load_agent_executor(agent_func_path)
+            self.executor = _load_agent_executor(agent_func_path, verl_agent_format=verl_agent_format)
         else:
             self.executor = SingleTurnAgentExecutor(remote_rm_url)
 
@@ -196,6 +199,7 @@ def create_vllm_engines(
     logprobs_mode=None,
     agent_func_path: Optional[str] = None,
     remote_rm_url: Optional[str] = None,
+    verl_agent_format: bool = False,
 ):
     """Spin up a set of vLLM Ray actors with consistent placement."""
     vllm_engines = []
@@ -245,6 +249,7 @@ def create_vllm_engines(
             {
                 "agent_func_path": agent_func_path,
                 "remote_rm_url": remote_rm_url,
+                "verl_agent_format": verl_agent_format,
             }
         )
 
