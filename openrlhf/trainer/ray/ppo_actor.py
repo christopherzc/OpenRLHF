@@ -328,11 +328,62 @@ class ActorPPOTrainer(ABC):
             )
 
         self.strategy.backward(loss, self.actor, self.actor_optim)
+
+        # NaN diagnostic: check gradients after backward (before optimizer step)
+        do_step = (not self.args.use_dynamic_batch) or self.replay_buffer.dynamic_optimizer_step[step]
+        if do_step:
+            grad_nan_count = 0
+            grad_total_count = 0
+            first_nan_param = None
+            for pname, p in self.actor.model.module.named_parameters():
+                if hasattr(p, 'ds_tensor') and p.ds_tensor is not None:
+                    shard = p.ds_tensor
+                    n_nan = torch.isnan(shard).sum().item()
+                    grad_total_count += 1
+                    if n_nan > 0 and first_nan_param is None:
+                        first_nan_param = f"{pname} (shard shape={list(shard.shape)}, {n_nan}/{shard.numel()} NaN)"
+                        grad_nan_count += 1
+                    elif n_nan > 0:
+                        grad_nan_count += 1
+
+            if grad_nan_count > 0:
+                raise RuntimeError(
+                    f"[Actor training_step {step}] NaN in parameter shards BEFORE optimizer step! "
+                    f"{grad_nan_count}/{grad_total_count} param shards have NaN. "
+                    f"First: {first_nan_param}. "
+                    f"The model weights were already corrupted before this training step."
+                )
+
         if self.args.use_dynamic_batch:
             if self.replay_buffer.dynamic_optimizer_step[step]:
                 self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
         else:
             self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+
+        # NaN diagnostic: check weights after optimizer step
+        if do_step:
+            weight_nan_count = 0
+            weight_total_count = 0
+            first_nan_weight = None
+            for pname, p in self.actor.model.module.named_parameters():
+                if hasattr(p, 'ds_tensor') and p.ds_tensor is not None:
+                    shard = p.ds_tensor
+                    n_nan = torch.isnan(shard).sum().item()
+                    weight_total_count += 1
+                    if n_nan > 0 and first_nan_weight is None:
+                        first_nan_weight = f"{pname} (shard shape={list(shard.shape)}, {n_nan}/{shard.numel()} NaN)"
+                        weight_nan_count += 1
+                    elif n_nan > 0:
+                        weight_nan_count += 1
+
+            if weight_nan_count > 0:
+                raise RuntimeError(
+                    f"[Actor training_step {step}] NaN in parameter shards AFTER optimizer step! "
+                    f"{weight_nan_count}/{weight_total_count} param shards have NaN. "
+                    f"First: {first_nan_weight}. "
+                    f"The optimizer step corrupted the weights. "
+                    f"loss={loss.item()}, lr={self.actor_scheduler.get_last_lr()[0]}"
+                )
 
         if self.ema_model:
             if self.args.use_dynamic_batch:

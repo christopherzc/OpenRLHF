@@ -84,21 +84,17 @@ def _logsumexp_by_chunk(logits: torch.Tensor, chunk_size: int = 1024) -> torch.T
 
 def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     if temperature != 1.0:
-        logits.div_(temperature)
+        logits = logits / temperature  # avoid in-place op on tensors in the autograd graph
     # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
     if logits.dtype in [torch.float32, torch.float64]:
         batch_dim = logits.shape[:-1]
         last_dim = logits.shape[-1]
-        try:
-            from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
-
-            output = cross_entropy_loss(logits.reshape(-1, last_dim), labels.reshape(-1))
-            log_probs_labels = -output[0].view(*batch_dim)
-        except ImportError:
-            logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-            logsumexp_values = _logsumexp_by_chunk(logits.reshape(-1, last_dim))
-            logsumexp_values = logsumexp_values.view(*batch_dim)
-            log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+        # Use PyTorch-native path instead of Triton cross_entropy to avoid potential
+        # gradient computation issues (NaN investigation)
+        logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        logsumexp_values = _logsumexp_by_chunk(logits.reshape(-1, last_dim))
+        logsumexp_values = logsumexp_values.view(*batch_dim)
+        log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
         log_probs_labels = []
         for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption
