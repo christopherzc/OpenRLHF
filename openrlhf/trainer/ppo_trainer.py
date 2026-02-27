@@ -144,7 +144,7 @@ class BasePPOTrainer(ABC):
             # TODO: KL controller must be FixedKLController; AdaptiveKLController is incompatible here.
             self.kl_ctl.update(status["kl"], self.args.rollout_batch_size * self.args.n_samples_per_prompt)
 
-        status["generated_samples"] = sample0
+        status["generated_samples"] = [_sample0_text, _sample0_reward]
         return status, global_step + 1
 
     def ppo_train(self, global_steps: int) -> Dict:
