@@ -87,8 +87,10 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         # Execute multiple steps of interaction
         while True:
             if self.verl_agent_format:
-                # Budget based on fresh inference prompt
-                sampling_params.max_tokens = max_length - len(inference_tokens)
+                # Budget based on training sequence length (not the short
+                # inference prompt), so the total episode stays within
+                # max_length and generation per turn stays small.
+                sampling_params.max_tokens = max_length - len(training_tokens)
             else:
                 sampling_params.max_tokens = max_length - len(current_obs_tokens)
             # No budget to generate, break
