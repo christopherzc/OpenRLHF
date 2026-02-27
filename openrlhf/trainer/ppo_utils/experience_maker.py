@@ -449,6 +449,26 @@ class SamplesGenerator:
         if score_val is not None:
             info["score"] = torch.tensor([score_val])
 
+        # Store per-turn reward placement data for multi-turn GAE.
+        # action_mask is shifted by 1 (action_mask = original[1:truncate_length]),
+        # so action_ranges need the same -1 offset to align.
+        # Wrapped in an extra list so concat_experiences merge (sum(items,[])) preserves
+        # per-sample boundaries: [[sample1_data], [sample2_data]] -> [sample1_data, sample2_data]
+        per_turn_rewards = response.get("per_turn_rewards", None)
+        if per_turn_rewards and len(per_turn_rewards) >= 1 and len(tokenized_ranges) >= 1:
+            # Adjust action ranges for the 1-offset in action_mask and truncation
+            adjusted_ranges = []
+            for start, end in tokenized_ranges:
+                adj_start = start - 1  # offset for action_mask shift
+                adj_end = end - 1
+                # Clip to truncated length
+                adj_end = min(adj_end, truncate_length - 1)
+                if adj_start < truncate_length - 1:
+                    adjusted_ranges.append((adj_start, adj_end))
+            # Only keep rewards for ranges that survived truncation
+            info["_per_turn_rewards"] = [per_turn_rewards[:len(adjusted_ranges)]]
+            info["_per_turn_action_ranges"] = [adjusted_ranges]
+
         # Convert extra logs to tensors for downstream consumers.
         extra_logs = response.get("extra_logs", {})
         for key, value in extra_logs.items():
@@ -749,13 +769,59 @@ class RemoteExperienceMaker:
 
         # calculate return and advantages
         for experience, reward in zip(experiences, rewards):
-            reward = compute_reward(
-                reward,
-                self.kl_ctl.value,
-                experience.kl,
-                action_mask=experience.action_mask,
-                reward_clip_range=args.reward_clip_range,
-            )
+            # Multi-turn per-turn reward placement: instead of placing the total
+            # reward at the very last action token (which makes GAE signal decay
+            # through hundreds of non-action tokens between turns), place each
+            # turn's reward at that turn's last action token.
+            per_turn_rewards_list = experience.info.get("_per_turn_rewards", None)
+            per_turn_ranges_list = experience.info.get("_per_turn_action_ranges", None)
+
+            if per_turn_rewards_list is not None and per_turn_ranges_list is not None:
+                # Build per-token reward tensor with per-turn placement
+                kl_coef = self.kl_ctl.value
+                if kl_coef <= 0.0:
+                    kl_coef = 0.0
+                kl_reward = -kl_coef * experience.kl if experience.kl is not None else torch.zeros_like(experience.action_mask, dtype=torch.float)
+
+                batch_size = experience.action_mask.size(0)
+                seq_len = experience.action_mask.size(1)
+                per_turn_reward_tensor = torch.zeros(batch_size, seq_len, dtype=kl_reward.dtype, device=kl_reward.device)
+
+                for b in range(batch_size):
+                    if b < len(per_turn_rewards_list) and b < len(per_turn_ranges_list):
+                        sample_rewards = per_turn_rewards_list[b]
+                        sample_ranges = per_turn_ranges_list[b]
+                        for turn_idx, (start, end) in enumerate(sample_ranges):
+                            if turn_idx < len(sample_rewards):
+                                # Place this turn's reward at the last action token of this turn
+                                last_action_pos = min(end - 1, seq_len - 1)
+                                if last_action_pos >= 0 and last_action_pos < seq_len:
+                                    r_val = sample_rewards[turn_idx]
+                                    if args.reward_clip_range:
+                                        r_val = max(args.reward_clip_range[0], min(args.reward_clip_range[1], r_val))
+                                    per_turn_reward_tensor[b, last_action_pos] = r_val
+
+                reward = per_turn_reward_tensor + kl_reward
+
+                # Log first sample's per-turn placement for debugging
+                if per_turn_rewards_list and per_turn_ranges_list:
+                    logger.info(
+                        f"[Per-turn reward] sample 0: rewards={per_turn_rewards_list[0]}, "
+                        f"ranges={per_turn_ranges_list[0]}, "
+                        f"reward_nonzero_positions={torch.nonzero(per_turn_reward_tensor[0]).flatten().tolist()}"
+                    )
+
+                # Clean up internal info keys
+                del experience.info["_per_turn_rewards"]
+                del experience.info["_per_turn_action_ranges"]
+            else:
+                reward = compute_reward(
+                    reward,
+                    self.kl_ctl.value,
+                    experience.kl,
+                    action_mask=experience.action_mask,
+                    reward_clip_range=args.reward_clip_range,
+                )
 
             if self.advantage_estimator == "gae":
                 experience.advantages, experience.returns = self.get_advantages_and_returns(

@@ -75,6 +75,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
 
         # Initialize tracking variables
         action_ranges = []
+        per_turn_rewards = []
         total_reward = 0
         final_scores = 0
         extra_logs = {}
@@ -123,7 +124,9 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             }
             step_result = await agent_instance.step(states)
 
-            total_reward += step_result["rewards"].item()
+            turn_reward = step_result["rewards"].item()
+            per_turn_rewards.append(turn_reward)
+            total_reward += turn_reward
             final_scores = step_result.get("scores", total_reward)
             environment_feedback_text = step_result["environment_feedback"]
             done = step_result["done"]
@@ -186,6 +189,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             "scores": final_scores,
             "observation_tokens": training_tokens if self.verl_agent_format else current_obs_tokens,
             "action_ranges": action_ranges,
+            "per_turn_rewards": per_turn_rewards,
             "rollout_log_probs": rollout_log_probs,
             "extra_logs": extra_logs,
         }
