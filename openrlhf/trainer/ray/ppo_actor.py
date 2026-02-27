@@ -327,7 +327,57 @@ class ActorPPOTrainer(ABC):
                 f"  advantages range=[{advantages.min().item():.4f}, {advantages.max().item():.4f}]"
             )
 
+        # Gradient NaN diagnostic hooks — detect WHERE NaN first appears during backward.
+        # Hook order (backward flows from loss → model):
+        #   1. action_log_probs grad: NaN here = loss computation issue
+        #   2. output.logits grad: NaN here = log_probs_from_logits backward issue
+        #   If both clean: NaN originates inside the model backward (bf16 numerics)
+        _grad_nan_info = {}
+
+        def _check_grad(grad, name):
+            n_nan = torch.isnan(grad).sum().item()
+            n_inf = torch.isinf(grad).sum().item()
+            if n_nan > 0 or n_inf > 0:
+                finite_vals = grad[torch.isfinite(grad)]
+                _grad_nan_info[name] = {
+                    "nan": n_nan, "inf": n_inf, "total": grad.numel(),
+                    "shape": list(grad.shape), "dtype": str(grad.dtype),
+                    "max_abs_finite": finite_vals.abs().max().item() if finite_vals.numel() > 0 else float("nan"),
+                }
+
+        hook_handles = []
+        hook_handles.append(action_log_probs.register_hook(lambda g: _check_grad(g, "action_log_probs")))
+        if hasattr(output, "logits") and output.logits is not None and output.logits.requires_grad:
+            hook_handles.append(output.logits.register_hook(lambda g: _check_grad(g, "output_logits")))
+
         self.strategy.backward(loss, self.actor, self.actor_optim)
+
+        # Clean up hooks
+        for h in hook_handles:
+            h.remove()
+
+        # Report gradient NaN findings
+        if _grad_nan_info:
+            parts = [f"  - {name}: {info}" for name, info in _grad_nan_info.items()]
+            if "action_log_probs" in _grad_nan_info and "output_logits" in _grad_nan_info:
+                source = "NaN originates in the PPO loss computation (before log_probs)."
+            elif "output_logits" in _grad_nan_info:
+                source = "NaN originates in log_probs_from_logits backward (fp32 computation)."
+            elif "action_log_probs" in _grad_nan_info:
+                source = "NaN in action_log_probs grad but NOT in logits grad — check masking/slicing."
+            else:
+                source = "NaN detected at unexpected point."
+            raise RuntimeError(
+                f"[Actor training_step {step}] NaN/Inf gradient detected during backward!\n"
+                + "\n".join(parts) + "\n"
+                f"  Diagnosis: {source}\n"
+                f"  loss={loss.item()}, actor_loss={actor_loss.item()}"
+            )
+        else:
+            # Hooks were clean — if NaN appears in weights after optimizer step,
+            # it means the NaN originates INSIDE the model backward pass (bf16 numerics,
+            # e.g. flash attention backward or layer norm backward).
+            logger.info(f"[Step {step}] Gradient hooks clean — no NaN at loss→model boundary.")
 
         # NaN diagnostic: check gradients after backward (before optimizer step)
         do_step = (not self.args.use_dynamic_batch) or self.replay_buffer.dynamic_optimizer_step[step]

@@ -84,15 +84,18 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         else:
             rollout_log_probs = None
 
+        # Per-turn generation cap (from --generate_max_len).
+        # Each turn is capped at this many NEW tokens, while the total episode
+        # is still bounded by max_length.
+        per_turn_max_tokens = sampling_params.max_tokens
+
         # Execute multiple steps of interaction
         while True:
             if self.verl_agent_format:
-                # Budget based on training sequence length (not the short
-                # inference prompt), so the total episode stays within
-                # max_length and generation per turn stays small.
-                sampling_params.max_tokens = max_length - len(training_tokens)
+                remaining_budget = max_length - len(training_tokens)
             else:
-                sampling_params.max_tokens = max_length - len(current_obs_tokens)
+                remaining_budget = max_length - len(current_obs_tokens)
+            sampling_params.max_tokens = min(per_turn_max_tokens, remaining_budget)
             # No budget to generate, break
             if sampling_params.max_tokens <= 0:
                 break
