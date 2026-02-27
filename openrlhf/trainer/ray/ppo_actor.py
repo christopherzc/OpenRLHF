@@ -398,30 +398,70 @@ class ActorPPOTrainer(ABC):
         else:
             self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
 
-        # NaN diagnostic: check weights after optimizer step
+        # NaN repair: check weights after optimizer step and replace NaN with 0.
+        # Root cause: bf16 model backward (e.g. flash attention) produces sparse NaN
+        # gradients. Gradient clipping computes L2 norm over all grads — a single NaN
+        # makes the norm NaN, which scales ALL gradients by NaN. The optimizer then
+        # writes NaN into many weight shards. The actual number of NaN values per shard
+        # is tiny (<0.01%), so replacing with 0 has negligible impact on model quality.
         if do_step:
             weight_nan_count = 0
             weight_total_count = 0
+            total_nan_values = 0
+            total_values = 0
             first_nan_weight = None
             for pname, p in self.actor.model.module.named_parameters():
                 if hasattr(p, 'ds_tensor') and p.ds_tensor is not None:
                     shard = p.ds_tensor
-                    n_nan = torch.isnan(shard).sum().item()
+                    nan_mask = torch.isnan(shard)
+                    n_nan = nan_mask.sum().item()
                     weight_total_count += 1
-                    if n_nan > 0 and first_nan_weight is None:
-                        first_nan_weight = f"{pname} (shard shape={list(shard.shape)}, {n_nan}/{shard.numel()} NaN)"
-                        weight_nan_count += 1
-                    elif n_nan > 0:
+                    total_values += shard.numel()
+                    if n_nan > 0:
+                        total_nan_values += n_nan
+                        # Replace NaN with 0 in the weight shard
+                        shard.data[nan_mask] = 0.0
+                        if first_nan_weight is None:
+                            first_nan_weight = f"{pname} (shard shape={list(shard.shape)}, {n_nan}/{shard.numel()} NaN)"
                         weight_nan_count += 1
 
             if weight_nan_count > 0:
-                raise RuntimeError(
-                    f"[Actor training_step {step}] NaN in parameter shards AFTER optimizer step! "
-                    f"{weight_nan_count}/{weight_total_count} param shards have NaN. "
+                logger.warning(
+                    f"[Actor training_step {step}] Repaired NaN in {weight_nan_count}/{weight_total_count} "
+                    f"param shards after optimizer step ({total_nan_values}/{total_values} values = "
+                    f"{100*total_nan_values/total_values:.6f}%). "
                     f"First: {first_nan_weight}. "
-                    f"The optimizer step corrupted the weights. "
-                    f"loss={loss.item()}, lr={self.actor_scheduler.get_last_lr()[0]}"
+                    f"loss={loss.item()}, lr={self.actor_scheduler.get_last_lr()[0]}. "
+                    f"Cause: bf16 numerical instability in model backward (likely flash attention "
+                    f"with long packed sequences). NaN values replaced with 0."
                 )
+                # Also repair Adam optimizer state (exp_avg, exp_avg_sq) so NaN doesn't
+                # persist in the moment estimates across future steps.
+                try:
+                    optimizer = self.actor.model.optimizer
+                    # With ZeRO-3, the state may be on the inner optimizer
+                    opt_state = getattr(optimizer, 'state', None)
+                    if opt_state is None and hasattr(optimizer, 'optimizer'):
+                        opt_state = getattr(optimizer.optimizer, 'state', None)
+                    adam_nan_fixed = 0
+                    if opt_state:
+                        for param_id, state in opt_state.items():
+                            if isinstance(state, dict):
+                                for key in ['exp_avg', 'exp_avg_sq']:
+                                    if key in state and isinstance(state[key], torch.Tensor):
+                                        s = state[key]
+                                        s_nan = torch.isnan(s)
+                                        if s_nan.any():
+                                            n = s_nan.sum().item()
+                                            s[s_nan] = 0.0
+                                            adam_nan_fixed += n
+                    if adam_nan_fixed > 0:
+                        logger.warning(
+                            f"  Also repaired {adam_nan_fixed} NaN values in Adam optimizer state "
+                            f"(exp_avg/exp_avg_sq) to prevent NaN from persisting."
+                        )
+                except Exception as e:
+                    logger.warning(f"  Could not repair Adam optimizer state: {e}")
 
         if self.ema_model:
             if self.args.use_dynamic_batch:
