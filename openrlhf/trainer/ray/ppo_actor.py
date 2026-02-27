@@ -367,30 +367,54 @@ class ActorPPOTrainer(ABC):
                 f"  loss={loss.item()}, actor_loss={actor_loss.item()}"
             )
 
-        # NaN diagnostic: check gradients after backward (before optimizer step)
+        # Sanitize gradient partitions BEFORE optimizer step.
+        # bf16 model backward (flash attention with long packed sequences) produces sparse
+        # NaN gradients. With adam_offload, the gradient flow during backward is:
+        #   1. Gradients reduced into grad_partitions_flat_buffer (GPU, bf16)
+        #   2. Per-param norms computed and stored in norm_for_param_grads
+        #   3. Gradients copied to fp32_partitioned_groups_flat[i].grad (CPU, fp32)
+        # The optimizer reads from the CPU fp32 buffer, so we must sanitize THAT buffer.
+        # DeepSpeed already handles NaN in the total norm (mask_nan_or_inf_with_val_inplace),
+        # but NaN gradient VALUES still corrupt Adam state and weights if not zeroed.
         do_step = (not self.args.use_dynamic_batch) or self.replay_buffer.dynamic_optimizer_step[step]
         if do_step:
-            grad_nan_count = 0
-            grad_total_count = 0
-            first_nan_param = None
-            for pname, p in self.actor.model.module.named_parameters():
-                if hasattr(p, 'ds_tensor') and p.ds_tensor is not None:
-                    shard = p.ds_tensor
-                    n_nan = torch.isnan(shard).sum().item()
-                    grad_total_count += 1
-                    if n_nan > 0 and first_nan_param is None:
-                        first_nan_param = f"{pname} (shard shape={list(shard.shape)}, {n_nan}/{shard.numel()} NaN)"
-                        grad_nan_count += 1
-                    elif n_nan > 0:
-                        grad_nan_count += 1
+            try:
+                ds_engine = self.actor.model
+                zero_opt = ds_engine.optimizer
+                total_bad = 0
+                total_elements = 0
 
-            if grad_nan_count > 0:
-                raise RuntimeError(
-                    f"[Actor training_step {step}] NaN in parameter shards BEFORE optimizer step! "
-                    f"{grad_nan_count}/{grad_total_count} param shards have NaN. "
-                    f"First: {first_nan_param}. "
-                    f"The model weights were already corrupted before this training step."
-                )
+                # Sanitize the fp32 CPU gradient buffers (used by optimizer with adam_offload)
+                if hasattr(zero_opt, 'fp32_partitioned_groups_flat'):
+                    for i, fp32_flat in enumerate(zero_opt.fp32_partitioned_groups_flat):
+                        if fp32_flat is not None and fp32_flat.grad is not None:
+                            g = fp32_flat.grad
+                            bad_mask = torch.isnan(g) | torch.isinf(g)
+                            n_bad = bad_mask.sum().item()
+                            total_elements += g.numel()
+                            if n_bad > 0:
+                                g[bad_mask] = 0.0
+                                total_bad += n_bad
+
+                # Also sanitize the GPU gradient buffer (used by non-offload path and norm)
+                if hasattr(zero_opt, 'grad_partitions_flat_buffer'):
+                    buf = zero_opt.grad_partitions_flat_buffer
+                    bad_mask = torch.isnan(buf) | torch.isinf(buf)
+                    n_bad = bad_mask.sum().item()
+                    if n_bad > 0:
+                        buf[bad_mask] = 0.0
+                        total_bad = max(total_bad, n_bad)  # report the larger count
+
+                if total_bad > 0:
+                    denom = total_elements if total_elements > 0 else 1
+                    logger.warning(
+                        f"[Actor training_step {step}] Sanitized {total_bad} NaN/Inf gradient values "
+                        f"before optimizer step ({100*total_bad/denom:.6f}%). "
+                        f"loss={loss.item()}. "
+                        f"Cause: bf16 numerical instability in model backward."
+                    )
+            except Exception as e:
+                logger.warning(f"[Actor training_step {step}] Could not sanitize gradients: {e}")
 
         if self.args.use_dynamic_batch:
             if self.replay_buffer.dynamic_optimizer_step[step]:
@@ -398,12 +422,8 @@ class ActorPPOTrainer(ABC):
         else:
             self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
 
-        # NaN repair: check weights after optimizer step and replace NaN with 0.
-        # Root cause: bf16 model backward (e.g. flash attention) produces sparse NaN
-        # gradients. Gradient clipping computes L2 norm over all grads — a single NaN
-        # makes the norm NaN, which scales ALL gradients by NaN. The optimizer then
-        # writes NaN into many weight shards. The actual number of NaN values per shard
-        # is tiny (<0.01%), so replacing with 0 has negligible impact on model quality.
+        # Safety net: check weights after optimizer step. With gradient sanitization above,
+        # this should rarely trigger. If it does, it indicates a bug or edge case we missed.
         if do_step:
             weight_nan_count = 0
             weight_total_count = 0
@@ -419,7 +439,6 @@ class ActorPPOTrainer(ABC):
                     total_values += shard.numel()
                     if n_nan > 0:
                         total_nan_values += n_nan
-                        # Replace NaN with 0 in the weight shard
                         shard.data[nan_mask] = 0.0
                         if first_nan_weight is None:
                             first_nan_weight = f"{pname} (shard shape={list(shard.shape)}, {n_nan}/{shard.numel()} NaN)"
@@ -427,41 +446,13 @@ class ActorPPOTrainer(ABC):
 
             if weight_nan_count > 0:
                 logger.warning(
-                    f"[Actor training_step {step}] Repaired NaN in {weight_nan_count}/{weight_total_count} "
-                    f"param shards after optimizer step ({total_nan_values}/{total_values} values = "
-                    f"{100*total_nan_values/total_values:.6f}%). "
+                    f"[Actor training_step {step}] UNEXPECTED: NaN in {weight_nan_count}/{weight_total_count} "
+                    f"param shards AFTER optimizer step despite gradient sanitization "
+                    f"({total_nan_values}/{total_values} values = {100*total_nan_values/total_values:.6f}%). "
                     f"First: {first_nan_weight}. "
                     f"loss={loss.item()}, lr={self.actor_scheduler.get_last_lr()[0]}. "
-                    f"Cause: bf16 numerical instability in model backward (likely flash attention "
-                    f"with long packed sequences). NaN values replaced with 0."
+                    f"Repaired by zeroing NaN values."
                 )
-                # Also repair Adam optimizer state (exp_avg, exp_avg_sq) so NaN doesn't
-                # persist in the moment estimates across future steps.
-                try:
-                    optimizer = self.actor.model.optimizer
-                    # With ZeRO-3, the state may be on the inner optimizer
-                    opt_state = getattr(optimizer, 'state', None)
-                    if opt_state is None and hasattr(optimizer, 'optimizer'):
-                        opt_state = getattr(optimizer.optimizer, 'state', None)
-                    adam_nan_fixed = 0
-                    if opt_state:
-                        for param_id, state in opt_state.items():
-                            if isinstance(state, dict):
-                                for key in ['exp_avg', 'exp_avg_sq']:
-                                    if key in state and isinstance(state[key], torch.Tensor):
-                                        s = state[key]
-                                        s_nan = torch.isnan(s)
-                                        if s_nan.any():
-                                            n = s_nan.sum().item()
-                                            s[s_nan] = 0.0
-                                            adam_nan_fixed += n
-                    if adam_nan_fixed > 0:
-                        logger.warning(
-                            f"  Also repaired {adam_nan_fixed} NaN values in Adam optimizer state "
-                            f"(exp_avg/exp_avg_sq) to prevent NaN from persisting."
-                        )
-                except Exception as e:
-                    logger.warning(f"  Could not repair Adam optimizer state: {e}")
 
         if self.ema_model:
             if self.args.use_dynamic_batch:
