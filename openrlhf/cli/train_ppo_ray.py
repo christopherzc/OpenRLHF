@@ -572,6 +572,13 @@ if __name__ == "__main__":
         if args.kl_estimator not in ["k1"]:
             print(f"Recommend setting {args.kl_estimator} to 'k1' when not using KL as a loss.")
 
+    # verl-agent defaults to low_var_kl (k3) for the KL estimator, which is
+    # asymmetric and penalizes large policy deviations more aggressively than
+    # k2 (MSE). Override to k3 when the user hasn't explicitly set it.
+    if args.verl_agent_format and args.use_kl_loss and args.kl_estimator == "k1":
+        print("[verl_agent_format] Overriding kl_estimator from 'k1' to 'k3' (low_var_kl) to match verl-agent defaults.")
+        args.kl_estimator = "k3"
+
     # Set vLLM generate_batch_size to rollout_batch_size if not specified
     if not args.vllm_generate_batch_size:
         args.vllm_generate_batch_size = args.rollout_batch_size

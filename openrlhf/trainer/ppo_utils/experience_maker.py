@@ -778,9 +778,15 @@ class RemoteExperienceMaker:
 
             if per_turn_rewards_list is not None and per_turn_ranges_list is not None:
                 # Build per-token reward tensor with per-turn placement
-                kl_coef = self.kl_ctl.value
-                if kl_coef <= 0.0:
+                # When use_kl_loss is enabled, KL is applied as a direct loss term
+                # in the actor loss, so skip adding it to the reward to avoid
+                # double-penalizing (matching verl-agent's use_kl_in_reward=False).
+                if args.use_kl_loss:
                     kl_coef = 0.0
+                else:
+                    kl_coef = self.kl_ctl.value
+                    if kl_coef <= 0.0:
+                        kl_coef = 0.0
                 kl_reward = -kl_coef * experience.kl if experience.kl is not None else torch.zeros_like(experience.action_mask, dtype=torch.float)
 
                 batch_size = experience.action_mask.size(0)
@@ -815,9 +821,13 @@ class RemoteExperienceMaker:
                 del experience.info["_per_turn_rewards"]
                 del experience.info["_per_turn_action_ranges"]
             else:
+                # When use_kl_loss is enabled, KL is applied as a direct loss term
+                # in the actor loss, so skip adding it to the reward to avoid
+                # double-penalizing (matching verl-agent's use_kl_in_reward=False).
+                reward_kl_coef = 0.0 if args.use_kl_loss else self.kl_ctl.value
                 reward = compute_reward(
                     reward,
-                    self.kl_ctl.value,
+                    reward_kl_coef,
                     experience.kl,
                     action_mask=experience.action_mask,
                     reward_clip_range=args.reward_clip_range,
