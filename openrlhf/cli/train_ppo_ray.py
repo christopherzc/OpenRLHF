@@ -579,6 +579,16 @@ if __name__ == "__main__":
         print("[verl_agent_format] Overriding kl_estimator from 'k1' to 'k3' (low_var_kl) to match verl-agent defaults.")
         args.kl_estimator = "k3"
 
+    # verl-agent uses seq-mean-token-sum-norm loss aggregation, which sums
+    # per-token losses per sequence then divides by max_seq_len. This prevents
+    # short responses from getting disproportionately large gradients compared
+    # to long sequences (critical for stop/continue tasks with 6-token responses).
+    if args.verl_agent_format:
+        args.loss_agg_mode = "seq-mean-token-sum-norm"
+        print(f"[verl_agent_format] Using loss_agg_mode='seq-mean-token-sum-norm' to match verl-agent.")
+    else:
+        args.loss_agg_mode = None
+
     # Set vLLM generate_batch_size to rollout_batch_size if not specified
     if not args.vllm_generate_batch_size:
         args.vllm_generate_batch_size = args.rollout_batch_size

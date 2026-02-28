@@ -14,7 +14,7 @@ from tqdm import tqdm
 from transformers.trainer import get_scheduler
 
 from openrlhf.models import Actor, PolicyLoss
-from openrlhf.models.utils import compute_approx_kl, masked_mean
+from openrlhf.models.utils import agg_loss, compute_approx_kl, masked_mean
 from openrlhf.trainer.ppo_utils.experience_maker import Experience
 from openrlhf.utils import get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
@@ -78,6 +78,7 @@ class ActorPPOTrainer(ABC):
                 self.args.vllm_is_truncated_threshold if self.args.enable_vllm_is_correction else None
             ),
             vllm_is_correction_type=self.args.vllm_is_correction_type,
+            loss_agg_mode=getattr(self.args, "loss_agg_mode", None),
         )
 
         # Mixtral 8x7b
@@ -285,7 +286,11 @@ class ActorPPOTrainer(ABC):
             else:
                 kl = torch.zeros_like(action_log_probs)
                 logprobs_diff = torch.zeros_like(action_log_probs)
-            kl_loss = masked_mean(kl, experience.action_mask)
+            loss_agg_mode = getattr(self.args, "loss_agg_mode", None)
+            if loss_agg_mode is not None:
+                kl_loss = agg_loss(kl, experience.action_mask, mode=loss_agg_mode)
+            else:
+                kl_loss = masked_mean(kl, experience.action_mask)
             logprobs_diff = masked_mean(logprobs_diff, experience.action_mask)
             experience.info["kl"] = kl_loss.detach()
             experience.info["logprobs_diff"] = logprobs_diff.detach()
@@ -298,7 +303,15 @@ class ActorPPOTrainer(ABC):
             loss += output.aux_loss * self.args.aux_loss_coef
         # entropy loss
         if self.args.entropy_loss_coef is not None:
-            entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
+            loss_agg_mode = getattr(self.args, "loss_agg_mode", None)
+            if loss_agg_mode is not None:
+                entropy_loss = agg_loss(
+                    output.entropy[:, -experience.action_mask.shape[1] :],
+                    experience.action_mask,
+                    mode=loss_agg_mode,
+                )
+            else:
+                entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
             if self.args.entropy_loss_coef != 0:
                 loss -= entropy_loss * self.args.entropy_loss_coef
 

@@ -5,7 +5,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import masked_mean
+from .utils import agg_loss, masked_mean
 
 
 class GPTLMLoss(nn.Module):
@@ -87,11 +87,13 @@ class PolicyLoss(nn.Module):
         enable_vllm_is_correction: bool = False,
         vllm_is_truncated_threshold: list = None,
         vllm_is_correction_type: str = "tis",
+        loss_agg_mode: str = None,
     ) -> None:
         super().__init__()
         self.clip_eps_low = clip_eps_low
         self.clip_eps_high = clip_eps_high
         self.token_level_loss = token_level_loss
+        self.loss_agg_mode = loss_agg_mode
         self.dual_clip = dual_clip
         self.policy_loss_type = policy_loss_type
         self.enable_vllm_is_correction = enable_vllm_is_correction
@@ -172,11 +174,13 @@ class PolicyLoss(nn.Module):
                 loss = vllm_is * loss
             vllm_kl = masked_mean(rollout_log_probs - old_log_probs, action_mask, dim=None)
 
-        loss = (
-            masked_mean(loss, action_mask, dim=None)
-            if self.token_level_loss
-            else masked_mean(loss, action_mask, dim=-1).mean()
-        )
+        if self.loss_agg_mode is not None:
+            loss = agg_loss(loss, action_mask, mode=self.loss_agg_mode)
+        elif self.token_level_loss:
+            loss = masked_mean(loss, action_mask, dim=None)
+        else:
+            loss = masked_mean(loss, action_mask, dim=-1).mean()
+        # Metrics always use token-mean (independent of loss aggregation)
         clip_ratio = masked_mean(torch.lt(surr2, surr1).float(), action_mask, dim=None)
         ppo_kl = masked_mean(-log_ratio.detach(), action_mask, dim=None)
         return loss, clip_ratio, ppo_kl, vllm_kl

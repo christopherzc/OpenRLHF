@@ -35,6 +35,10 @@ def compute_approx_kl(
     if kl_estimator == "k3":
         log_ratio = log_probs.float() - log_probs_base.float()
         log_ratio = -log_ratio
+        # Clamp log_ratio before exp() to prevent gradient overflow in bf16.
+        # exp(10) ≈ 2.2e4 is safe; larger values cause NaN gradients when
+        # flowing back through bf16 model parameters.
+        log_ratio = log_ratio.clamp(min=-10, max=10)
         log_ratio = log_ratio.exp() - 1 - log_ratio
 
     log_ratio = log_ratio.clamp(min=-10, max=10)
@@ -109,6 +113,28 @@ def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = N
     if mask is None:
         return tensor.mean(dim=dim)
     return (tensor * mask).sum(dim=dim) / mask.sum(dim=dim)
+
+
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, mode: str = "token-mean") -> torch.Tensor:
+    """Aggregate a per-token loss matrix into a scalar.
+
+    Matches verl-agent's agg_loss (core_algos.py).
+
+    Args:
+        loss_mat: (batch_size, seq_len)
+        loss_mask: (batch_size, seq_len)
+        mode: aggregation mode
+    """
+    if mode == "token-mean":
+        return masked_mean(loss_mat, loss_mask, dim=None)
+    elif mode == "seq-mean-token-sum-norm":
+        # Sum tokens per sequence, then divide by max sequence length.
+        # This gives shorter sequences proportionally less weight,
+        # preventing tiny responses from dominating the gradient.
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        return torch.sum(seq_losses) / loss_mask.shape[-1]
+    else:
+        raise ValueError(f"Invalid loss agg mode: {mode}")
 
 
 def masked_normalize(tensor: torch.Tensor, mask: torch.Tensor, dim: int = 1, eps: float = 1e-8) -> torch.Tensor:
