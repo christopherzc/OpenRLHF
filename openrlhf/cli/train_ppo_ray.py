@@ -581,11 +581,14 @@ if __name__ == "__main__":
 
     # verl-agent uses seq-mean-token-sum-norm loss aggregation, which sums
     # per-token losses per sequence then divides by max_seq_len. This prevents
-    # short responses from getting disproportionately large gradients compared
-    # to long sequences (critical for stop/continue tasks with 6-token responses).
+    # In verl-agent, seq-mean-token-sum-norm works because response_mask covers
+    # ALL response tokens (dense mask, ~16 tokens). In OpenRLHF agent format,
+    # action_mask is sparse (~6 action tokens in ~3000-6000 token responses),
+    # so dividing by response_length makes gradients ~1000x too weak.
+    # Use token-mean (default) which normalizes by actual action token count.
     if args.verl_agent_format:
-        args.loss_agg_mode = "seq-mean-token-sum-norm"
-        print(f"[verl_agent_format] Using loss_agg_mode='seq-mean-token-sum-norm' to match verl-agent.")
+        args.loss_agg_mode = None  # token-mean (default)
+        print(f"[verl_agent_format] Using default token-mean loss aggregation (sparse action mask).")
     else:
         args.loss_agg_mode = None
 

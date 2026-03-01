@@ -1,6 +1,9 @@
 import asyncio
+import time
+from datetime import timedelta
 
 import ray
+import torch
 from ray.util.queue import Queue
 from tqdm import tqdm
 
@@ -66,6 +69,67 @@ class GenerateSamplesActor:
 
     def load_state_dict(self, state_dict):
         self.prompts_dataloader.load_state_dict(state_dict)
+
+    def run_evaluation(self, n_samples_per_prompt: int) -> dict:
+        """Run evaluation on the eval dataset and return metrics.
+
+        Called remotely by TrainingActor at eval_steps intervals.
+        Must acquire vLLM lock since generation uses the engines.
+        """
+        if not self.eval_dataloader:
+            return {}
+
+        start_time = time.time()
+        logger.info(f"⏰ Evaluation start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Collect prompt-to-datasource mapping
+        prompt_to_datasource = {}
+        for datasources, prompts, labels in self.eval_dataloader:
+            for prompt, datasource in zip(prompts, datasources):
+                prompt_to_datasource[prompt] = datasource
+
+        # Generate eval samples (uses vLLM engines)
+        eval_kwargs = self.generate_kwargs.copy()
+        eval_kwargs["temperature"] = self.args.eval_temperature
+        eval_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
+
+        ray.get(self.vllm_lock.acquire.remote())
+        try:
+            samples_list = self.samples_generator.generate_eval_samples(**eval_kwargs)
+        finally:
+            ray.get(self.vllm_lock.release.remote())
+
+        # Compute pass@k and pass@1 metrics
+        all_prompts = sum([s.prompts for s in samples_list], [])
+        rewards_list = [s.rewards for s in samples_list]
+        rewards = torch.tensor(rewards_list).reshape(-1, n_samples_per_prompt)
+
+        global_metrics = {}
+        num_prompts = len(all_prompts) // n_samples_per_prompt
+        for i in range(num_prompts):
+            original_prompt = all_prompts[i * n_samples_per_prompt]
+            datasource = prompt_to_datasource.get(original_prompt, "unknown")
+            if datasource not in global_metrics:
+                global_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
+            chunk_rewards = rewards[i]
+            if n_samples_per_prompt > 1:
+                global_metrics[datasource][f"pass{n_samples_per_prompt}"] += chunk_rewards.max().float().item()
+            global_metrics[datasource]["pass1"] += chunk_rewards.mean().float().item()
+            global_metrics[datasource]["count"] += 1
+
+        logs = {}
+        for datasource, metrics in global_metrics.items():
+            if n_samples_per_prompt > 1:
+                logs[f"eval_{datasource}_pass{n_samples_per_prompt}"] = (
+                    metrics[f"pass{n_samples_per_prompt}"] / metrics["count"]
+                )
+            logs[f"eval_{datasource}_pass1"] = metrics["pass1"] / metrics["count"]
+
+        duration = time.time() - start_time
+        time_str = str(timedelta(seconds=duration)).split(".")[0]
+        logger.info(f"✨ Evaluation completed in {time_str}, eval_metrics: {logs}")
+
+        return logs
 
     def fit(self, episode: int, total_consumed_prompts: int):
         for episode in range(episode, self.args.num_episodes):
@@ -144,6 +208,10 @@ class TrainingActor(BasePPOTrainer):
         self.rollout_queue = rollout_queue
         self.rollout_slots = rollout_slots
 
+    def set_generator_actor(self, generator_actor):
+        """Store reference to the generator actor for requesting eval."""
+        self.generator_actor = generator_actor
+
     def fit(self, global_step: int):
         while True:
             payload = self.rollout_queue.get(block=True)
@@ -165,6 +233,24 @@ class TrainingActor(BasePPOTrainer):
 
             client_states.update({"global_step": global_step})
             self.save_logs_and_checkpoints(global_step, status, client_states)
+
+            # Run evaluation at specified intervals
+            if (
+                global_step % self.args.eval_steps == 0
+                and self.args.eval_steps != float("inf")
+                and hasattr(self, "generator_actor")
+            ):
+                eval_metrics = ray.get(
+                    self.generator_actor.run_evaluation.remote(
+                        n_samples_per_prompt=self.args.eval_n_samples_per_prompt,
+                    )
+                )
+                if eval_metrics:
+                    logger.info(f"✨ Eval at global step {global_step}: {eval_metrics}")
+                    if self.wandb_logger:
+                        self.wandb_logger.log_eval(global_step, eval_metrics)
+                    if self.tensorboard_logger:
+                        self.tensorboard_logger.log_eval(global_step, eval_metrics)
 
         if self.wandb_logger:
             self.wandb_logger.close()
@@ -252,6 +338,9 @@ class PPOTrainerAsync:
                     self.trainer_actor.broadcast_to_vllm.remote(),
                 ]
             )
+
+        # Give the trainer a handle to the generator so it can request eval.
+        ray.get(self.trainer_actor.set_generator_actor.remote(self.generator_actor))
 
         # Launch async training
         ray.get(
