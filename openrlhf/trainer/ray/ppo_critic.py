@@ -12,7 +12,7 @@ from transformers.trainer import get_scheduler
 
 from openrlhf.models import ValueLoss, get_llm_for_sequence_regression
 from openrlhf.models.utils import masked_mean
-from openrlhf.trainer.ppo_utils.experience_maker import Experience
+from openrlhf.trainer.ppo_utils.experience_maker import Experience, densify_action_tensors
 from openrlhf.utils import get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
@@ -118,16 +118,23 @@ class CriticPPOTrainer(ABC):
         packed_seq_lens = None
         attention_mask = experience.attention_mask
 
+        # Use sparse mask for forward pass if available (verl_agent_format densification)
+        forward_mask = experience.sparse_action_mask if experience.sparse_action_mask is not None else action_mask
+
         # critic loss
         values, output = self.critic(
             sequences,
-            action_mask=action_mask,
+            action_mask=forward_mask,
             attention_mask=attention_mask,
             return_output=True,
             ring_attn_group=self.strategy.ring_attn_group,
             values_allgather=True,
             packed_seq_lens=packed_seq_lens,
         )
+
+        # Densify forward pass output if using dense action masks
+        if experience.sparse_action_mask is not None:
+            _, values = densify_action_tensors(forward_mask, values)
 
         # loss function
         critic_loss = self.critic_loss_fn(

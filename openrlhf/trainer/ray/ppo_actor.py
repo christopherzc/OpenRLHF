@@ -15,7 +15,7 @@ from transformers.trainer import get_scheduler
 
 from openrlhf.models import Actor, PolicyLoss
 from openrlhf.models.utils import agg_loss, compute_approx_kl, masked_mean
-from openrlhf.trainer.ppo_utils.experience_maker import Experience
+from openrlhf.trainer.ppo_utils.experience_maker import Experience, densify_action_tensors
 from openrlhf.utils import get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
@@ -252,16 +252,23 @@ class ActorPPOTrainer(ABC):
                 + "\n".join(f"  - {d}" for d in nan_diagnostics)
             )
 
+        # Use sparse mask for forward pass if available (verl_agent_format densification)
+        forward_mask = experience.sparse_action_mask if experience.sparse_action_mask is not None else action_mask
+
         # actor loss
         action_log_probs, output = self.actor(
             sequences,
-            action_mask,
+            forward_mask,
             attention_mask=attention_mask,
             return_output=True,
             ring_attn_group=self.strategy.ring_attn_group,
             packed_seq_lens=packed_seq_lens,
             return_entropy=self.args.entropy_loss_coef is not None,
         )
+
+        # Densify forward pass output if using dense action masks
+        if experience.sparse_action_mask is not None:
+            _, action_log_probs = densify_action_tensors(forward_mask, action_log_probs)
 
         # loss function
         actor_loss, clip_ratio, ppo_kl, vllm_kl = self.actor_loss_fn(
@@ -305,17 +312,25 @@ class ActorPPOTrainer(ABC):
             loss += output.aux_loss * self.args.aux_loss_coef
         # entropy loss
         if self.args.entropy_loss_coef is not None:
+            # Extract entropy at action positions
+            if experience.sparse_action_mask is not None:
+                # Densify entropy from sparse forward pass output
+                entropy_sparse = output.entropy[:, -forward_mask.shape[1]:]
+                _, entropy_for_loss = densify_action_tensors(forward_mask, entropy_sparse)
+            else:
+                entropy_for_loss = output.entropy[:, -experience.action_mask.shape[1]:]
+
             loss_agg_mode = getattr(self.args, "loss_agg_mode", None)
             norm_length = getattr(self.args, "loss_agg_norm_length", None)
             if loss_agg_mode is not None:
                 entropy_loss = agg_loss(
-                    output.entropy[:, -experience.action_mask.shape[1] :],
+                    entropy_for_loss,
                     experience.action_mask,
                     mode=loss_agg_mode,
                     norm_length=norm_length,
                 )
             else:
-                entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
+                entropy_loss = masked_mean(entropy_for_loss, experience.action_mask)
             if self.args.entropy_loss_coef != 0:
                 loss -= entropy_loss * self.args.entropy_loss_coef
 

@@ -579,16 +579,13 @@ if __name__ == "__main__":
         print("[verl_agent_format] Overriding kl_estimator from 'k1' to 'k3' (low_var_kl) to match verl-agent defaults.")
         args.kl_estimator = "k3"
 
-    # verl-agent uses seq-mean-token-sum-norm, dividing by response_mask.shape[-1]
-    # which equals max_response_length (~16). In OpenRLHF agent format,
-    # action_mask.shape[-1] is the full transcript length (~5000), NOT response
-    # length, so we pass generate_max_len as the fixed normalizer to match
-    # verl-agent's gradient scale.
+    # With dense action mask densification (verl_agent_format), the action_mask
+    # is all-ones with shape (B, num_actions), so masked_mean = simple mean,
+    # matching verl-agent's behavior naturally. No loss_agg_mode hack needed.
     if args.verl_agent_format:
-        args.loss_agg_mode = "seq-mean-token-sum-norm"
-        args.loss_agg_norm_length = args.generate_max_len
-        print(f"[verl_agent_format] Using loss_agg_mode='seq-mean-token-sum-norm' "
-              f"with norm_length={args.loss_agg_norm_length} (generate_max_len).")
+        args.loss_agg_mode = None
+        args.loss_agg_norm_length = None
+        print(f"[verl_agent_format] Using dense action mask — loss_agg_mode=token-mean (default).")
     else:
         args.loss_agg_mode = None
         args.loss_agg_norm_length = None
