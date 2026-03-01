@@ -21,40 +21,6 @@ from openrlhf.utils.utils import zero_pad_sequences
 logger = init_logger(__name__)
 
 
-def densify_action_tensors(action_mask: torch.Tensor, *tensors: torch.Tensor):
-    """Gather values at action positions from sparse tensors into dense (B, max_actions) tensors.
-
-    Used for verl_agent_format to convert sparse action masks (B, ~6000) with ~6 active
-    positions into dense (B, ~6) tensors, matching verl-agent's dense response format.
-
-    Args:
-        action_mask: (B, S) sparse boolean mask with 1s at action positions
-        *tensors: (B, S) tensors to densify
-
-    Returns:
-        dense_mask: (B, max_actions) mask with 1s for valid actions, 0s for padding
-        *dense_tensors: (B, max_actions) gathered tensors, zero-padded
-    """
-    batch_size = action_mask.size(0)
-    action_counts = action_mask.sum(dim=1).long()
-    max_actions = action_counts.max().item()
-    if max_actions == 0:
-        max_actions = 1  # avoid empty tensors
-
-    dense_mask = torch.zeros(batch_size, max_actions, dtype=action_mask.dtype, device=action_mask.device)
-    dense_tensors = [torch.zeros(batch_size, max_actions, dtype=t.dtype, device=t.device) for t in tensors]
-
-    for b in range(batch_size):
-        indices = torch.where(action_mask[b])[0]
-        n = indices.size(0)
-        if n > 0:
-            dense_mask[b, :n] = 1
-            for dt, t in zip(dense_tensors, tensors):
-                dt[b, :n] = t[b, indices]
-
-    return (dense_mask, *dense_tensors)
-
-
 def to(tensor: Union[torch.Tensor, list[torch.Tensor]], device):
     if isinstance(tensor, list):
         return [to(t, device) for t in tensor]
@@ -89,7 +55,6 @@ class Experience:
     sequences: torch.Tensor = None
     attention_mask: torch.LongTensor = None
     action_mask: torch.BoolTensor = None
-    sparse_action_mask: torch.BoolTensor = None  # Original sparse mask for forward pass (verl_agent_format)
 
     action_log_probs: torch.Tensor = None
     base_action_log_probs: torch.Tensor = None
@@ -120,7 +85,6 @@ class Experience:
         advantages=None,
         attention_mask=None,
         action_mask=None,
-        sparse_action_mask=None,
         kl=None,
         prompts=None,
         labels=None,
@@ -138,7 +102,6 @@ class Experience:
         self.advantages = advantages
         self.attention_mask = attention_mask
         self.action_mask = action_mask
-        self.sparse_action_mask = sparse_action_mask
         self.kl = kl
         self.prompts = prompts or []
         self.labels = labels or []
@@ -747,51 +710,6 @@ class RemoteExperienceMaker:
             samples.kl = kl
             samples.info["kl"] = kl_mean
             samples.info["logprobs_diff"] = logprobs_diff_mean
-
-            # Densify action tensors for verl_agent_format: convert sparse (B, ~6000)
-            # tensors with ~6 active positions into dense (B, ~6) tensors.
-            # This must happen after all forward passes but before GAE/loss computation.
-            if getattr(args, 'verl_agent_format', False):
-                sparse_mask = samples.action_mask
-                samples.sparse_action_mask = sparse_mask.clone()
-
-                # Collect all action-aligned tensors to densify
-                to_densify = []
-                names = []
-                for name in ['action_log_probs', 'base_action_log_probs', 'values', 'kl', 'rollout_log_probs']:
-                    val = getattr(samples, name)
-                    if val is not None:
-                        to_densify.append(val)
-                        names.append(name)
-
-                dense_mask, *dense_vals = densify_action_tensors(sparse_mask, *to_densify)
-                for name, dv in zip(names, dense_vals):
-                    setattr(samples, name, dv)
-
-                # Remap per_turn_action_ranges from sparse to dense positions
-                per_turn_ranges = samples.info.get("_per_turn_action_ranges", None)
-                if per_turn_ranges is not None:
-                    batch_size = sparse_mask.size(0)
-                    for b in range(batch_size):
-                        if b < len(per_turn_ranges):
-                            sparse_indices = torch.where(sparse_mask[b])[0].tolist()
-                            s2d = {s: d for d, s in enumerate(sparse_indices)}
-                            new_ranges = []
-                            for start, end in per_turn_ranges[b]:
-                                # end-1 is the last action position in sparse space
-                                d_end = s2d.get(min(end - 1, sparse_mask.size(1) - 1))
-                                if d_end is not None:
-                                    new_ranges.append((0, d_end + 1))
-                            per_turn_ranges[b] = new_ranges
-
-                samples.action_mask = dense_mask
-
-                if i == 0:
-                    logger.info(
-                        f"[Dense action mask] Densified: sparse ({sparse_mask.shape}) → "
-                        f"dense ({dense_mask.shape}), active actions per sample: "
-                        f"{dense_mask.sum(dim=1).tolist()[:4]}"
-                    )
 
         end_time = time.time()
         duration = end_time - start_time

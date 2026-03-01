@@ -37,7 +37,6 @@ class BufferItem:
     advantages: torch.Tensor
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
-    sparse_action_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
 
 
@@ -117,37 +116,14 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
 def remove_padding_in_sequences(items):
     for item in items:
-        # Calculate right padding for sequence-dimension tensors using attention_mask
-        seq_right_pad = item.attention_mask.flip(0).argmax()
-        seq_right_pad = None if seq_right_pad == 0 else -seq_right_pad
+        right_pad = item.attention_mask.flip(0).argmax()
+        right_pad = None if right_pad == 0 else -right_pad
 
-        # Calculate right padding for action-dimension tensors
-        # When using dense action masks (verl_agent_format), action tensors have
-        # different length from sequence tensors, so need separate padding computation
-        if item.sparse_action_mask is not None:
-            # Dense action_mask: compute padding from its own trailing zeros
-            act_right_pad_val = item.action_mask.flip(0).argmax()
-            act_right_pad = None if act_right_pad_val == 0 else -act_right_pad_val
-        else:
-            act_right_pad = seq_right_pad
-
-        # Sequence-dimension keys: same length as sequences/attention_mask
-        seq_keys = {'sequences', 'attention_mask'}
-        # Sparse mask: length S-1, trimmed with sequence padding
-        sparse_keys = {'sparse_action_mask'}
-        skip_keys = {'info'}
-        # Everything else is action-dimension (dense action_mask length or S-1)
-
-        keys = tuple(field.name for field in fields(BufferItem) if field.name not in skip_keys)
+        keys = tuple(field.name for field in fields(BufferItem) if field.name != "info")
         for key in keys:
             value = getattr(item, key)
             if value is not None:
-                if key in seq_keys:
-                    setattr(item, key, value[:seq_right_pad])
-                elif key in sparse_keys:
-                    setattr(item, key, value[:seq_right_pad])
-                else:
-                    setattr(item, key, value[:act_right_pad])
+                setattr(item, key, value[:right_pad])
 
     return items
 
