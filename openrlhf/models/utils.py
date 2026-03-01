@@ -115,7 +115,7 @@ def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = N
     return (tensor * mask).sum(dim=dim) / mask.sum(dim=dim)
 
 
-def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, mode: str = "token-mean") -> torch.Tensor:
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, mode: str = "token-mean", norm_length: int = None) -> torch.Tensor:
     """Aggregate a per-token loss matrix into a scalar.
 
     Matches verl-agent's agg_loss (core_algos.py).
@@ -124,15 +124,17 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, mode: str = "token
         loss_mat: (batch_size, seq_len)
         loss_mask: (batch_size, seq_len)
         mode: aggregation mode
+        norm_length: fixed normalizer for seq-mean-token-sum-norm. If None,
+            uses loss_mask.shape[-1] (verl-agent default). In OpenRLHF's agent
+            format, action_mask.shape[-1] is the full transcript length (~5000),
+            not the response length (~16), so pass generate_max_len here.
     """
     if mode == "token-mean":
         return masked_mean(loss_mat, loss_mask, dim=None)
     elif mode == "seq-mean-token-sum-norm":
-        # Sum tokens per sequence, then divide by max sequence length.
-        # This gives shorter sequences proportionally less weight,
-        # preventing tiny responses from dominating the gradient.
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-        return torch.sum(seq_losses) / loss_mask.shape[-1]
+        divisor = norm_length if norm_length is not None else loss_mask.shape[-1]
+        return torch.sum(seq_losses) / divisor
     else:
         raise ValueError(f"Invalid loss agg mode: {mode}")
 

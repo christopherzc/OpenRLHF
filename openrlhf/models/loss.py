@@ -88,12 +88,14 @@ class PolicyLoss(nn.Module):
         vllm_is_truncated_threshold: list = None,
         vllm_is_correction_type: str = "tis",
         loss_agg_mode: str = None,
+        loss_agg_norm_length: int = None,
     ) -> None:
         super().__init__()
         self.clip_eps_low = clip_eps_low
         self.clip_eps_high = clip_eps_high
         self.token_level_loss = token_level_loss
         self.loss_agg_mode = loss_agg_mode
+        self.loss_agg_norm_length = loss_agg_norm_length
         self.dual_clip = dual_clip
         self.policy_loss_type = policy_loss_type
         self.enable_vllm_is_correction = enable_vllm_is_correction
@@ -175,7 +177,7 @@ class PolicyLoss(nn.Module):
             vllm_kl = masked_mean(rollout_log_probs - old_log_probs, action_mask, dim=None)
 
         if self.loss_agg_mode is not None:
-            loss = agg_loss(loss, action_mask, mode=self.loss_agg_mode)
+            loss = agg_loss(loss, action_mask, mode=self.loss_agg_mode, norm_length=self.loss_agg_norm_length)
         elif self.token_level_loss:
             loss = masked_mean(loss, action_mask, dim=None)
         else:
@@ -191,10 +193,11 @@ class ValueLoss(nn.Module):
     Value Loss for PPO
     """
 
-    def __init__(self, clip_eps: float = None, token_level_loss: bool = True) -> None:
+    def __init__(self, clip_eps: float = None, token_level_loss: bool = True, value_loss_coef: float = 0.5) -> None:
         super().__init__()
         self.clip_eps = clip_eps
         self.token_level_loss = token_level_loss
+        self.value_loss_coef = value_loss_coef
 
     def forward(
         self,
@@ -216,7 +219,7 @@ class ValueLoss(nn.Module):
             if self.token_level_loss
             else masked_mean(loss, action_mask, dim=-1).mean()
         )
-        return 0.5 * loss
+        return self.value_loss_coef * loss
 
 
 class PairWiseLoss(nn.Module):

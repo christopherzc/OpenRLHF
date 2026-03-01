@@ -579,18 +579,24 @@ if __name__ == "__main__":
         print("[verl_agent_format] Overriding kl_estimator from 'k1' to 'k3' (low_var_kl) to match verl-agent defaults.")
         args.kl_estimator = "k3"
 
-    # verl-agent uses seq-mean-token-sum-norm loss aggregation, which sums
-    # per-token losses per sequence then divides by max_seq_len. This prevents
-    # In verl-agent, seq-mean-token-sum-norm works because response_mask covers
-    # ALL response tokens (dense mask, ~16 tokens). In OpenRLHF agent format,
-    # action_mask is sparse (~6 action tokens in ~3000-6000 token responses),
-    # so dividing by response_length makes gradients ~1000x too weak.
-    # Use token-mean (default) which normalizes by actual action token count.
+    # verl-agent uses seq-mean-token-sum-norm, dividing by response_mask.shape[-1]
+    # which equals max_response_length (~16). In OpenRLHF agent format,
+    # action_mask.shape[-1] is the full transcript length (~5000), NOT response
+    # length, so we pass generate_max_len as the fixed normalizer to match
+    # verl-agent's gradient scale.
     if args.verl_agent_format:
-        args.loss_agg_mode = None  # token-mean (default)
-        print(f"[verl_agent_format] Using default token-mean loss aggregation (sparse action mask).")
+        args.loss_agg_mode = "seq-mean-token-sum-norm"
+        args.loss_agg_norm_length = args.generate_max_len
+        print(f"[verl_agent_format] Using loss_agg_mode='seq-mean-token-sum-norm' "
+              f"with norm_length={args.loss_agg_norm_length} (generate_max_len).")
     else:
         args.loss_agg_mode = None
+        args.loss_agg_norm_length = None
+
+    # verl-agent defaults to entropy_coeff=0.001 for exploration bonus.
+    if args.verl_agent_format and args.entropy_loss_coef is None:
+        args.entropy_loss_coef = 0.001
+        print(f"[verl_agent_format] Setting entropy_loss_coef=0.001 to match verl-agent defaults.")
 
     # Set vLLM generate_batch_size to rollout_batch_size if not specified
     if not args.vllm_generate_batch_size:

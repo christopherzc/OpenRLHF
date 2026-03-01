@@ -55,7 +55,8 @@ class CriticPPOTrainer(ABC):
             self.args.use_dynamic_batch,
         )
 
-        self.critic_loss_fn = ValueLoss(value_clip)
+        value_loss_coef = 1.0 if getattr(self.args, "verl_agent_format", False) else 0.5
+        self.critic_loss_fn = ValueLoss(value_clip, value_loss_coef=value_loss_coef)
 
         # Mixtral 8x7b
         self.aux_loss = self.args.aux_loss_coef > 1e-8
@@ -141,7 +142,7 @@ class CriticPPOTrainer(ABC):
         else:
             aux_loss = 0
         loss = critic_loss + aux_loss * self.args.aux_loss_coef
-        if self.args.use_dynamic_batch:
+        if self.args.use_dynamic_batch and not getattr(self.args, "verl_agent_format", False):
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
         self.strategy.backward(loss, self.critic, self.critic_optim)

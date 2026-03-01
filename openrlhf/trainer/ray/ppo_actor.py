@@ -79,6 +79,7 @@ class ActorPPOTrainer(ABC):
             ),
             vllm_is_correction_type=self.args.vllm_is_correction_type,
             loss_agg_mode=getattr(self.args, "loss_agg_mode", None),
+            loss_agg_norm_length=getattr(self.args, "loss_agg_norm_length", None),
         )
 
         # Mixtral 8x7b
@@ -287,8 +288,9 @@ class ActorPPOTrainer(ABC):
                 kl = torch.zeros_like(action_log_probs)
                 logprobs_diff = torch.zeros_like(action_log_probs)
             loss_agg_mode = getattr(self.args, "loss_agg_mode", None)
+            norm_length = getattr(self.args, "loss_agg_norm_length", None)
             if loss_agg_mode is not None:
-                kl_loss = agg_loss(kl, experience.action_mask, mode=loss_agg_mode)
+                kl_loss = agg_loss(kl, experience.action_mask, mode=loss_agg_mode, norm_length=norm_length)
             else:
                 kl_loss = masked_mean(kl, experience.action_mask)
             logprobs_diff = masked_mean(logprobs_diff, experience.action_mask)
@@ -304,18 +306,20 @@ class ActorPPOTrainer(ABC):
         # entropy loss
         if self.args.entropy_loss_coef is not None:
             loss_agg_mode = getattr(self.args, "loss_agg_mode", None)
+            norm_length = getattr(self.args, "loss_agg_norm_length", None)
             if loss_agg_mode is not None:
                 entropy_loss = agg_loss(
                     output.entropy[:, -experience.action_mask.shape[1] :],
                     experience.action_mask,
                     mode=loss_agg_mode,
+                    norm_length=norm_length,
                 )
             else:
                 entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
             if self.args.entropy_loss_coef != 0:
                 loss -= entropy_loss * self.args.entropy_loss_coef
 
-        if self.args.use_dynamic_batch:
+        if self.args.use_dynamic_batch and not getattr(self.args, "verl_agent_format", False):
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
         # NaN detection: check loss before backward to prevent weight corruption
