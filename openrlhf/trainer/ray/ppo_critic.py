@@ -56,7 +56,12 @@ class CriticPPOTrainer(ABC):
         )
 
         value_loss_coef = 1.0 if getattr(self.args, "verl_agent_format", False) else 0.5
-        self.critic_loss_fn = ValueLoss(value_clip, value_loss_coef=value_loss_coef)
+        self.critic_loss_fn = ValueLoss(
+            value_clip,
+            value_loss_coef=value_loss_coef,
+            loss_agg_mode=getattr(self.args, "loss_agg_mode", None),
+            loss_agg_norm_length=getattr(self.args, "loss_agg_norm_length", None),
+        )
 
         # Mixtral 8x7b
         self.aux_loss = self.args.aux_loss_coef > 1e-8

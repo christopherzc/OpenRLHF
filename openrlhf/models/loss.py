@@ -193,11 +193,20 @@ class ValueLoss(nn.Module):
     Value Loss for PPO
     """
 
-    def __init__(self, clip_eps: float = None, token_level_loss: bool = True, value_loss_coef: float = 0.5) -> None:
+    def __init__(
+        self,
+        clip_eps: float = None,
+        token_level_loss: bool = True,
+        value_loss_coef: float = 0.5,
+        loss_agg_mode: str = None,
+        loss_agg_norm_length: int = None,
+    ) -> None:
         super().__init__()
         self.clip_eps = clip_eps
         self.token_level_loss = token_level_loss
         self.value_loss_coef = value_loss_coef
+        self.loss_agg_mode = loss_agg_mode
+        self.loss_agg_norm_length = loss_agg_norm_length
 
     def forward(
         self,
@@ -214,11 +223,12 @@ class ValueLoss(nn.Module):
         else:
             loss = (values - returns) ** 2
 
-        loss = (
-            masked_mean(loss, action_mask, dim=None)
-            if self.token_level_loss
-            else masked_mean(loss, action_mask, dim=-1).mean()
-        )
+        if self.loss_agg_mode is not None:
+            loss = agg_loss(loss, action_mask, mode=self.loss_agg_mode, norm_length=self.loss_agg_norm_length)
+        elif self.token_level_loss:
+            loss = masked_mean(loss, action_mask, dim=None)
+        else:
+            loss = masked_mean(loss, action_mask, dim=-1).mean()
         return self.value_loss_coef * loss
 
 

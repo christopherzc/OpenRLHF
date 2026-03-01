@@ -579,13 +579,15 @@ if __name__ == "__main__":
         print("[verl_agent_format] Overriding kl_estimator from 'k1' to 'k3' (low_var_kl) to match verl-agent defaults.")
         args.kl_estimator = "k3"
 
-    # With dense action mask densification (verl_agent_format), the action_mask
-    # is all-ones with shape (B, num_actions), so masked_mean = simple mean,
-    # matching verl-agent's behavior naturally. No loss_agg_mode hack needed.
+    # With dense action mask densification (verl_agent_format), action_mask has
+    # shape (B, max_actions) with mostly 1s. Use seq-mean-token-sum-norm to match
+    # verl-agent's loss aggregation: sum per sequence, divide by tensor width.
+    # norm_length=None uses loss_mask.shape[-1] (= max_actions ≈ 42), matching
+    # verl-agent where the divisor is response_length.
     if args.verl_agent_format:
-        args.loss_agg_mode = None
+        args.loss_agg_mode = "seq-mean-token-sum-norm"
         args.loss_agg_norm_length = None
-        print(f"[verl_agent_format] Using dense action mask — loss_agg_mode=token-mean (default).")
+        print(f"[verl_agent_format] Using dense action mask — loss_agg_mode=seq-mean-token-sum-norm.")
     else:
         args.loss_agg_mode = None
         args.loss_agg_norm_length = None
