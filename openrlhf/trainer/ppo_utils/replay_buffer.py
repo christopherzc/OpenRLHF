@@ -319,7 +319,18 @@ class NaiveReplayBuffer(ABC):
         world_size = dist.get_world_size()
         dp_size = world_size // args.ring_attn_size // args.ds_tensor_parallel_size
         local_train_batch_size = args.train_batch_size // dp_size
-        num_steps = args.rollout_batch_size * args.n_samples_per_prompt // args.train_batch_size
+        # Use actual buffer size instead of config-based calculation.
+        # With per-turn split, the buffer has more items than
+        # rollout_batch_size * n_samples_per_prompt.
+        # Sync num_steps across DP ranks (different ranks may have slightly
+        # different item counts due to variable turns per trajectory).
+        num_steps_tensor = torch.tensor(
+            [len(self.items) // local_train_batch_size],
+            dtype=torch.int, device=torch.cuda.current_device()
+        )
+        num_steps_tensor = strategy.all_reduce(num_steps_tensor, op="min")
+        num_steps = num_steps_tensor.item()
+        print(f"[Dynamic batch] {len(self.items)} items, local_train_batch_size={local_train_batch_size}, num_steps={num_steps}")
 
         # split by train_batch_size, sync num_microbatches across dp
         num_microbatches = []
