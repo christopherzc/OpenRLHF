@@ -420,7 +420,7 @@ class DeepspeedStrategy(ABC):
         torch_dist_barrier_and_cuda_sync()
 
     def all_reduce(self, data, op="mean"):
-        assert op in ("mean", "max", "sum")
+        assert op in ("mean", "max", "min", "sum")
         if isinstance(data, dict):
             ret = {}
             for k, v in data.items():
@@ -437,7 +437,8 @@ class DeepspeedStrategy(ABC):
                 data = data.to(torch.cuda.current_device())
             if op == "mean":
                 data /= self.world_size
-            dist.all_reduce(data, op=dist.ReduceOp.MAX if op == "max" else dist.ReduceOp.SUM)
+            reduce_op_map = {"max": dist.ReduceOp.MAX, "min": dist.ReduceOp.MIN, "sum": dist.ReduceOp.SUM}
+            dist.all_reduce(data, op=reduce_op_map.get(op, dist.ReduceOp.SUM))
             if is_cpu_tensor:
                 data = data.cpu()
             return data.item() if not is_tensor else data
