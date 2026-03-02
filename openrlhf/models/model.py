@@ -295,6 +295,21 @@ def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="
             if self.normalize_reward:
                 values = (values - self.mean) / self.std
 
+            # Defensive alignment: per-turn slicing edge cases can occasionally
+            # produce a 1-token mismatch between critic values and action_mask.
+            # Align to the shared tail instead of failing the entire run.
+            if values.shape[1] != action_mask.shape[1]:
+                aligned_len = min(values.shape[1], action_mask.shape[1])
+                logger.warning(
+                    "Critic forward length mismatch: values=%s, action_mask=%s; "
+                    "aligning to shared tail length=%s.",
+                    values.shape[1],
+                    action_mask.shape[1],
+                    aligned_len,
+                )
+                values = values[:, -aligned_len:]
+                action_mask = action_mask[:, -aligned_len:]
+
             action_values = values[:, -action_mask.shape[1] :] * action_mask.float()
 
             if return_output:

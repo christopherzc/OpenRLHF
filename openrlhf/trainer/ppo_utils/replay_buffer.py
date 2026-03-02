@@ -306,12 +306,16 @@ class NaiveReplayBuffer(ABC):
         items = split_experience_batch(experience)
         items = remove_padding_in_sequences(items)
 
-        # Per-turn split: if items have per-turn data, split each multi-turn
-        # BufferItem into individual per-turn BufferItems
-        if items and items[0].info.get("_per_turn_action_ranges") is not None:
-            num_before = len(items)
-            items = split_into_per_turn_items(items)
-            print(f"[Per-turn split] {num_before} trajectories -> {len(items)} per-turn items")
+        # Clean up per-turn metadata keys. These are consumed upstream by
+        # compute_advantages_and_returns() for per-turn reward placement and
+        # action-level GAE. Leaving them as ragged lists in BufferItem.info
+        # can cause downstream tensorization errors during batching/logging.
+        # Always pop unconditionally to avoid mixed-batch edge cases where
+        # only a subset of items carries the internal _per_turn_* keys.
+        for item in items:
+            item.info.pop("_per_turn_action_ranges", None)
+            item.info.pop("_per_turn_rewards", None)
+            item.info.pop("_per_turn_prompt_starts", None)
 
         self.items.extend(items)
         if self.limit > 0:

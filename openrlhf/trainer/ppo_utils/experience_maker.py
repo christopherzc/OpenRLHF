@@ -852,7 +852,10 @@ class RemoteExperienceMaker:
                 )
 
             if self.advantage_estimator == "gae":
-                if per_turn_ranges_list is not None:
+                use_action_level_gae = (
+                    per_turn_ranges_list is not None and not getattr(args, "disable_action_level_gae", False)
+                )
+                if use_action_level_gae:
                     # Action-level GAE: skip non-action tokens so discount only
                     # accumulates across the ~42 action positions, not ~6000 tokens.
                     # Standard GAE decays by 0.9025 at EVERY token position, giving

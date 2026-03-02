@@ -41,11 +41,12 @@ def compute_approx_kl(
         log_ratio = log_ratio.clamp(min=-10, max=10)
         log_ratio = log_ratio.exp() - 1 - log_ratio
 
-    # Only clamp for k1 (which can be negative and is used directly as a loss).
-    # For k2/k3 (non-negative estimators), the input clamp before exp() already
-    # prevents overflow. Clamping the OUTPUT kills the gradient once the model
-    # diverges past the threshold, removing the KL penalty's corrective force.
-    if kl_estimator == "k1":
+    # Clamp output for k1 and k3. verl-agent clamps k3 output to [-10, 10]
+    # (core_algos.py kl_penalty()). Without output clamp, k3 can reach
+    # exp(10)-10-1 ≈ 22016 per token, causing KL loss of 440 with kl_coef=0.02
+    # — enough to overwhelm policy gradient signal and trigger KL spikes >200.
+    # The working Fix 7+8+9+10 run (94% win rate) had the output clamp.
+    if kl_estimator in ("k1", "k3"):
         log_ratio = log_ratio.clamp(min=-10, max=10)
     return log_ratio
 

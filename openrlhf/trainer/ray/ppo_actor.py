@@ -284,6 +284,14 @@ class ActorPPOTrainer(ABC):
                     kl_estimator=self.args.kl_estimator,
                 )
                 logprobs_diff = action_log_probs.float() - base_action_log_probs.float()
+                if self.args.kl_estimator == "k3":
+                    # Diagnostic: monitor how often k3 hits the output clamp ceiling.
+                    k3_input = (base_action_log_probs.float() - action_log_probs.float()).clamp(min=-10, max=10)
+                    k3_raw = k3_input.exp() - 1 - k3_input
+                    kl_clip_mask = (k3_raw >= 10).to(k3_raw.dtype)
+                    kl_clip_frac = masked_mean(kl_clip_mask, experience.action_mask, dim=None)
+                    experience.info["kl_clip_frac"] = kl_clip_frac.detach()
+                    experience.info["kl_raw_max"] = k3_raw.max().detach()
             else:
                 kl = torch.zeros_like(action_log_probs)
                 logprobs_diff = torch.zeros_like(action_log_probs)

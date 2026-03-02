@@ -402,6 +402,12 @@ if __name__ == "__main__":
         default="gae",
         help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline, group_norm, dr_grpo",
     )
+    parser.add_argument(
+        "--disable_action_level_gae",
+        action="store_true",
+        default=False,
+        help="Force standard token-level GAE even when per-turn replay metadata is present.",
+    )
     parser.add_argument("--use_kl_loss", action="store_true", default=False, help="whether to use KL loss from GRPO")
     parser.add_argument(
         "--no_advantage_std_norm",
