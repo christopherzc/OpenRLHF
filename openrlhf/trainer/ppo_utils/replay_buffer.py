@@ -1,3 +1,4 @@
+import math
 import random
 from abc import ABC
 from dataclasses import dataclass, fields
@@ -314,23 +315,47 @@ class NaiveReplayBuffer(ABC):
 
     def setup_dynamic_batch(self, strategy):
         args = strategy.args
-        sample_lengths = [sample.info["total_length"].item() for sample in self.items]
+        if len(self.items) == 0:
+            self.dynamic_indices = []
+            self.dynamic_loss_scale = []
+            self.dynamic_optimizer_step = []
+            self.sample_batch_size = 1
+            print("[Dynamic batch] 0 items, skipping setup_dynamic_batch")
+            return
 
         world_size = dist.get_world_size()
         dp_size = world_size // args.ring_attn_size // args.ds_tensor_parallel_size
         local_train_batch_size = args.train_batch_size // dp_size
-        # Use actual buffer size instead of config-based calculation.
-        # With per-turn split, the buffer has more items than
-        # rollout_batch_size * n_samples_per_prompt.
-        # Sync num_steps across DP ranks (different ranks may have slightly
-        # different item counts due to variable turns per trajectory).
-        num_steps_tensor = torch.tensor(
-            [len(self.items) // local_train_batch_size],
-            dtype=torch.int, device=torch.cuda.current_device()
+
+        # Fix 18:
+        # 1) Shuffle to avoid deterministic "tail drop" bias.
+        # 2) Align ranks by item count using global MAX and pad short ranks with
+        #    replacement so dynamic batching does not silently discard a fixed
+        #    suffix of experiences each step.
+        local_indices = list(range(len(self.items)))
+        random.shuffle(local_indices)
+
+        local_count_tensor = torch.tensor([len(local_indices)], dtype=torch.int, device=torch.cuda.current_device())
+        min_count = strategy.all_reduce(local_count_tensor.clone(), op="min").item()
+        max_count = strategy.all_reduce(local_count_tensor.clone(), op="max").item()
+
+        target_count = max_count
+        if len(local_indices) < target_count:
+            pad_n = target_count - len(local_indices)
+            local_indices.extend(random.choices(local_indices, k=pad_n))
+        elif len(local_indices) > target_count:
+            local_indices = local_indices[:target_count]
+
+        num_steps = int(math.ceil(target_count / local_train_batch_size))
+        target_total = num_steps * local_train_batch_size
+        if len(local_indices) < target_total:
+            local_indices.extend(random.choices(local_indices, k=target_total - len(local_indices)))
+
+        sample_lengths = [self.items[idx].info["total_length"].item() for idx in local_indices]
+        print(
+            f"[Dynamic batch] local_items={len(self.items)}, min_items={min_count}, max_items={max_count}, "
+            f"target_items={target_total}, local_train_batch_size={local_train_batch_size}, num_steps={num_steps}"
         )
-        num_steps_tensor = strategy.all_reduce(num_steps_tensor, op="min")
-        num_steps = num_steps_tensor.item()
-        print(f"[Dynamic batch] {len(self.items)} items, local_train_batch_size={local_train_batch_size}, num_steps={num_steps}")
 
         # split by train_batch_size, sync num_microbatches across dp
         num_microbatches = []
@@ -358,7 +383,8 @@ class NaiveReplayBuffer(ABC):
             partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)  # List[List[int]], index
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
-                    partitions[j][k] += start
+                    local_pos = partitions[j][k] + start
+                    partitions[j][k] = local_indices[local_pos]
             micro_batch_indices.extend(partitions)
             data_partitions.append(partitions)
         self.dynamic_indices = micro_batch_indices
