@@ -322,7 +322,7 @@ class ActorPPOTrainer(ABC):
             if self.args.entropy_loss_coef != 0:
                 loss -= entropy_loss * self.args.entropy_loss_coef
 
-        if self.args.use_dynamic_batch and not getattr(self.args, "verl_agent_format", False):
+        if self.args.use_dynamic_batch:
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
         # NaN detection: check loss before backward to prevent weight corruption

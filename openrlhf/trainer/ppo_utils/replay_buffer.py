@@ -132,20 +132,29 @@ def remove_padding_in_sequences(items):
 def split_into_per_turn_items(items: List[BufferItem]) -> List[BufferItem]:
     """Split multi-turn BufferItems into per-turn BufferItems.
 
-    For turn k with action range [start_k, end_k):
-    - sequences: truncated to [0, end_k+1) (autoregressive: safe to truncate after action)
-    - action_mask: 1s ONLY at [start_k, end_k), zeros elsewhere
-    - All action-dim tensors: truncated to end_k, values preserved only at [start_k, end_k)
+    For turn k with:
+    - action range [start_k, end_k) in action-token space (S-1)
+    - prompt start p_k in sequence-token space (S)
+
+    Build a local turn window:
+    - sequences / attention_mask: [p_k, end_k + 1)
+    - action tensors: [p_k - 1, end_k), rebased to local coordinates
+    - action_mask: 1s only on this turn's local action span
+
+    This aligns training context with verl-agent format where each decision is
+    trained against its own turn prompt, not a cumulative trajectory prefix.
     """
     per_turn_items = []
 
     for item in items:
         per_turn_ranges = item.info.get("_per_turn_action_ranges", None)
+        per_turn_prompt_starts = item.info.get("_per_turn_prompt_starts", None)
 
         if per_turn_ranges is None or not per_turn_ranges:
             # No per-turn data — keep item as-is, clean up internal keys
             item.info.pop("_per_turn_action_ranges", None)
             item.info.pop("_per_turn_rewards", None)
+            item.info.pop("_per_turn_prompt_starts", None)
             per_turn_items.append(item)
             continue
 
@@ -153,25 +162,51 @@ def split_into_per_turn_items(items: List[BufferItem]) -> List[BufferItem]:
             if start_k >= end_k:
                 continue
 
-            seq_trunc = end_k + 1  # sequence space (S)
-            act_trunc = end_k      # action-dim space (S-1)
+            if per_turn_prompt_starts is not None and turn_idx < len(per_turn_prompt_starts):
+                prompt_start_seq = int(per_turn_prompt_starts[turn_idx])
+            else:
+                prompt_start_seq = 0
+            prompt_start_seq = max(0, prompt_start_seq)
 
-            new_sequences = item.sequences[:seq_trunc].clone()
-            new_attention_mask = item.attention_mask[:seq_trunc].clone()
+            seq_start = prompt_start_seq
+            seq_end = end_k + 1  # exclusive, sequence-token space
+            if seq_start >= seq_end:
+                continue
 
-            # Turn-specific action_mask: 1s only at this turn's positions
-            new_action_mask = torch.zeros(act_trunc, dtype=item.action_mask.dtype)
-            new_action_mask[start_k:end_k] = 1
+            act_start = max(0, prompt_start_seq - 1)  # action-token space
+            act_end = end_k                            # exclusive
+            if act_start >= act_end:
+                continue
 
-            # Helper: truncate and keep only [start_k, end_k) values
-            def trunc_mask(tensor, s=start_k, e=end_k, trunc=act_trunc):
+            local_start = start_k - act_start
+            local_end = end_k - act_start
+            if not (0 <= local_start < local_end <= (act_end - act_start)):
+                continue
+
+            new_sequences = item.sequences[seq_start:seq_end].clone()
+            new_attention_mask = item.attention_mask[seq_start:seq_end].clone()
+
+            new_action_mask = torch.zeros(
+                act_end - act_start,
+                dtype=item.action_mask.dtype,
+                device=item.action_mask.device,
+            )
+            new_action_mask[local_start:local_end] = 1
+
+            # Helper: window action tensors and zero out off-turn positions.
+            def trunc_mask(tensor):
                 if tensor is None:
                     return None
-                result = torch.zeros(trunc, dtype=tensor.dtype)
-                result[s:e] = tensor[s:e]
+                result = torch.zeros(
+                    act_end - act_start,
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                )
+                window = tensor[act_start:act_end]
+                result[local_start:local_end] = window[local_start:local_end]
                 return result
 
-            # Build info (copy non-internal keys, set total_length)
+            # Build info (copy non-internal keys, set local lengths)
             new_info = {}
             for k, v in item.info.items():
                 if k.startswith("_per_turn_"):
@@ -180,7 +215,8 @@ def split_into_per_turn_items(items: List[BufferItem]) -> List[BufferItem]:
                     new_info[k] = v.clone()
                 else:
                     new_info[k] = v
-            new_info["total_length"] = torch.tensor(float(seq_trunc))
+            new_info["total_length"] = torch.tensor(float(seq_end - seq_start))
+            new_info["response_length"] = torch.tensor(float(new_action_mask.sum().item()))
 
             per_turn_items.append(BufferItem(
                 sequences=new_sequences,

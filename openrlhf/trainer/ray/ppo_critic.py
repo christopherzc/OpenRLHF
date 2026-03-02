@@ -147,7 +147,7 @@ class CriticPPOTrainer(ABC):
         else:
             aux_loss = 0
         loss = critic_loss + aux_loss * self.args.aux_loss_coef
-        if self.args.use_dynamic_batch and not getattr(self.args, "verl_agent_format", False):
+        if self.args.use_dynamic_batch:
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
         self.strategy.backward(loss, self.critic, self.critic_optim)

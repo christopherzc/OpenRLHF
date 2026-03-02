@@ -456,19 +456,38 @@ class SamplesGenerator:
         # Wrapped in an extra list so concat_experiences merge (sum(items,[])) preserves
         # per-sample boundaries: [[sample1_data], [sample2_data]] -> [sample1_data, sample2_data]
         per_turn_rewards = response.get("per_turn_rewards", None)
+        per_turn_prompt_starts = response.get("per_turn_prompt_starts", None)
         if per_turn_rewards and len(per_turn_rewards) >= 1 and len(tokenized_ranges) >= 1:
-            # Adjust action ranges for the 1-offset in action_mask and truncation
+            # Adjust per-turn metadata for the 1-offset in action_mask and truncation.
+            # _per_turn_action_ranges are stored in action-mask token space [0, S-1).
+            # _per_turn_prompt_starts are stored in sequence token space [0, S).
             adjusted_ranges = []
-            for start, end in tokenized_ranges:
+            adjusted_prompt_starts = []
+            adjusted_rewards = []
+
+            for turn_idx, (start, end) in enumerate(tokenized_ranges):
                 adj_start = start - 1  # offset for action_mask shift
-                adj_end = end - 1
-                # Clip to truncated length
-                adj_end = min(adj_end, truncate_length - 1)
-                if adj_start < truncate_length - 1:
-                    adjusted_ranges.append((adj_start, adj_end))
-            # Only keep rewards for ranges that survived truncation
-            info["_per_turn_rewards"] = [per_turn_rewards[:len(adjusted_ranges)]]
-            info["_per_turn_action_ranges"] = [adjusted_ranges]
+                adj_end = min(end - 1, truncate_length - 1)
+                if not (0 <= adj_start < adj_end):
+                    continue
+                if adj_start >= truncate_length - 1:
+                    continue
+
+                adjusted_ranges.append((adj_start, adj_end))
+                adjusted_rewards.append(per_turn_rewards[turn_idx] if turn_idx < len(per_turn_rewards) else 0.0)
+
+                if per_turn_prompt_starts and turn_idx < len(per_turn_prompt_starts):
+                    prompt_start = int(per_turn_prompt_starts[turn_idx])
+                else:
+                    # Fallback for backward compatibility with older rollouts.
+                    prompt_start = 0
+                prompt_start = max(0, min(prompt_start, truncate_length - 1))
+                adjusted_prompt_starts.append(prompt_start)
+
+            if adjusted_ranges:
+                info["_per_turn_rewards"] = [adjusted_rewards]
+                info["_per_turn_action_ranges"] = [adjusted_ranges]
+                info["_per_turn_prompt_starts"] = [adjusted_prompt_starts]
 
         # Convert extra logs to tensors for downstream consumers.
         extra_logs = response.get("extra_logs", {})

@@ -75,6 +75,9 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
 
         # Initialize tracking variables
         action_ranges = []
+        # Start index (in sequence token space) of each turn's prompt context.
+        # Used downstream to rebase per-turn PPO samples to local prompt windows.
+        per_turn_prompt_starts = []
         per_turn_rewards = []
         total_reward = 0
         final_scores = 0
@@ -100,6 +103,14 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             # No budget to generate, break
             if sampling_params.max_tokens <= 0:
                 break
+
+            # Record turn prompt start in training-sequence token space.
+            if self.verl_agent_format:
+                # inference_tokens is the prompt context used for this turn.
+                turn_prompt_start = len(training_tokens) - len(inference_tokens)
+                if turn_prompt_start < 0:
+                    turn_prompt_start = 0
+                per_turn_prompt_starts.append(turn_prompt_start)
 
             # Generate response asynchronously (input and output are token ids)
             gen_input = inference_tokens if self.verl_agent_format else current_obs_tokens
@@ -189,6 +200,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             "scores": final_scores,
             "observation_tokens": training_tokens if self.verl_agent_format else current_obs_tokens,
             "action_ranges": action_ranges,
+            "per_turn_prompt_starts": per_turn_prompt_starts if self.verl_agent_format else None,
             "per_turn_rewards": per_turn_rewards,
             "rollout_log_probs": rollout_log_probs,
             "extra_logs": extra_logs,
