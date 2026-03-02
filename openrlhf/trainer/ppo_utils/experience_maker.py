@@ -832,20 +832,27 @@ class RemoteExperienceMaker:
                 )
 
             if self.advantage_estimator == "gae":
-                # Always use whole-sequence GAE even with per-turn data.
-                # Per-turn GAE kills credit assignment because only the final
-                # turn has non-zero reward (intermediate turns get 0), so ~85%
-                # of per-turn items would have zero advantages.
-                # Whole-sequence GAE propagates the final reward backward
-                # through all turns via lambda decay. The per-turn split in
-                # the replay buffer still provides batch diversity benefits.
-                experience.advantages, experience.returns = self.get_advantages_and_returns(
-                    experience.values,
-                    reward,
-                    experience.action_mask,
-                    args.gamma,
-                    args.lambd,
-                )
+                if per_turn_ranges_list is not None:
+                    # Action-level GAE: skip non-action tokens so discount only
+                    # accumulates across the ~42 action positions, not ~6000 tokens.
+                    # Standard GAE decays by 0.9025 at EVERY token position, giving
+                    # 0.9025^1000 ≈ 0 between turns. Action-level gives 0.9025^6 ≈ 0.55
+                    # between adjacent turns — matching verl-agent's per-turn signal.
+                    experience.advantages, experience.returns = self.get_action_level_advantages_and_returns(
+                        experience.values,
+                        reward,
+                        experience.action_mask,
+                        args.gamma,
+                        args.lambd,
+                    )
+                else:
+                    experience.advantages, experience.returns = self.get_advantages_and_returns(
+                        experience.values,
+                        reward,
+                        experience.action_mask,
+                        args.gamma,
+                        args.lambd,
+                    )
             elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo"]:
                 if args.gamma != 1.0 and self.advantage_estimator in [
                     "rloo",
@@ -943,6 +950,51 @@ class RemoteExperienceMaker:
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
+        return advantages.detach(), returns
+
+    @torch.no_grad()
+    def get_action_level_advantages_and_returns(
+        self,
+        values: torch.Tensor,
+        rewards: torch.Tensor,
+        action_mask: torch.Tensor,
+        gamma: float,
+        lambd: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """GAE over action positions only, skipping non-action tokens.
+
+        Standard GAE iterates over ALL token positions. With sparse action masks
+        (e.g. verl-agent format: ~42 action tokens among ~6000 total), the GAE
+        accumulator decays by (gamma*lambd) at every non-action token. This kills
+        the advantage signal: 0.9025^1000 ≈ 0 between turns.
+
+        This method extracts only the action positions and runs GAE over those,
+        so discount only accumulates across actual decision points:
+        - Between adjacent turns (~6 action positions apart): 0.9025^6 ≈ 0.55
+        - Across full trajectory (~42 action positions): 0.9025^42 ≈ 0.015
+        """
+        batch_size, seq_len = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+
+        for b in range(batch_size):
+            action_pos = action_mask[b].nonzero(as_tuple=True)[0]
+            if len(action_pos) == 0:
+                continue
+
+            act_values = values[b, action_pos]
+            act_rewards = rewards[b, action_pos]
+            num_actions = len(action_pos)
+
+            lastgaelam = 0
+            for t in reversed(range(num_actions)):
+                nextval = act_values[t + 1] if t < num_actions - 1 else 0.0
+                delta = act_rewards[t] + gamma * nextval - act_values[t]
+                lastgaelam = delta + gamma * lambd * lastgaelam
+                advantages[b, action_pos[t]] = lastgaelam
+
+            returns[b, action_pos] = advantages[b, action_pos] + values[b, action_pos]
+
         return advantages.detach(), returns
 
     @torch.no_grad()
