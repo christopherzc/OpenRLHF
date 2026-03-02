@@ -817,9 +817,7 @@ class RemoteExperienceMaker:
                         f"reward_nonzero_positions={torch.nonzero(per_turn_reward_tensor[0]).flatten().tolist()}"
                     )
 
-                # Clean up internal info keys
-                del experience.info["_per_turn_rewards"]
-                del experience.info["_per_turn_action_ranges"]
+                # Keep _per_turn_* info keys for per-turn split in replay buffer
             else:
                 # When use_kl_loss is enabled, KL is applied as a direct loss term
                 # in the actor loss, so skip adding it to the reward to avoid
@@ -834,13 +832,23 @@ class RemoteExperienceMaker:
                 )
 
             if self.advantage_estimator == "gae":
-                experience.advantages, experience.returns = self.get_advantages_and_returns(
-                    experience.values,
-                    reward,
-                    experience.action_mask,
-                    args.gamma,
-                    args.lambd,
-                )
+                if per_turn_ranges_list is not None:
+                    experience.advantages, experience.returns = self.get_per_turn_advantages_and_returns(
+                        experience.values,
+                        reward,
+                        experience.action_mask,
+                        per_turn_ranges_list,
+                        args.gamma,
+                        args.lambd,
+                    )
+                else:
+                    experience.advantages, experience.returns = self.get_advantages_and_returns(
+                        experience.values,
+                        reward,
+                        experience.action_mask,
+                        args.gamma,
+                        args.lambd,
+                    )
             elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo"]:
                 if args.gamma != 1.0 and self.advantage_estimator in [
                     "rloo",
@@ -938,6 +946,55 @@ class RemoteExperienceMaker:
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
+        return advantages.detach(), returns
+
+    @torch.no_grad()
+    def get_per_turn_advantages_and_returns(
+        self,
+        values: torch.Tensor,
+        rewards: torch.Tensor,
+        action_mask: torch.Tensor,
+        per_turn_ranges_list: list,
+        gamma: float,
+        lambd: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute GAE independently per turn instead of over the whole sequence.
+
+        For each turn's action range [start_k, end_k), runs standard GAE over
+        just those ~6 positions. Eliminates the 0.95^1400 decay between turns
+        that kills the advantage signal in the whole-sequence approach.
+        """
+        batch_size, seq_len = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+
+        masked_values = action_mask * values
+        masked_rewards = action_mask * rewards
+
+        for b in range(batch_size):
+            if b >= len(per_turn_ranges_list):
+                continue
+            for start_k, end_k in per_turn_ranges_list[b]:
+                start_k = max(0, start_k)
+                end_k = min(end_k, seq_len)
+                if start_k >= end_k:
+                    continue
+
+                turn_values = masked_values[b, start_k:end_k]
+                turn_rewards = masked_rewards[b, start_k:end_k]
+                turn_len = end_k - start_k
+
+                lastgaelam = 0
+                turn_advs = torch.zeros(turn_len, dtype=rewards.dtype, device=rewards.device)
+                for t in reversed(range(turn_len)):
+                    nextval = turn_values[t + 1] if t < turn_len - 1 else 0.0
+                    delta = turn_rewards[t] + gamma * nextval - turn_values[t]
+                    lastgaelam = delta + gamma * lambd * lastgaelam
+                    turn_advs[t] = lastgaelam
+
+                advantages[b, start_k:end_k] = turn_advs
+                returns[b, start_k:end_k] = turn_advs + turn_values
+
         return advantages.detach(), returns
 
     @torch.no_grad()

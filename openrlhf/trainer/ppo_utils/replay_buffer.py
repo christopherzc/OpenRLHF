@@ -128,6 +128,75 @@ def remove_padding_in_sequences(items):
     return items
 
 
+def split_into_per_turn_items(items: List[BufferItem]) -> List[BufferItem]:
+    """Split multi-turn BufferItems into per-turn BufferItems.
+
+    For turn k with action range [start_k, end_k):
+    - sequences: truncated to [0, end_k+1) (autoregressive: safe to truncate after action)
+    - action_mask: 1s ONLY at [start_k, end_k), zeros elsewhere
+    - All action-dim tensors: truncated to end_k, values preserved only at [start_k, end_k)
+    """
+    per_turn_items = []
+
+    for item in items:
+        per_turn_ranges = item.info.get("_per_turn_action_ranges", None)
+
+        if per_turn_ranges is None or not per_turn_ranges:
+            # No per-turn data — keep item as-is, clean up internal keys
+            item.info.pop("_per_turn_action_ranges", None)
+            item.info.pop("_per_turn_rewards", None)
+            per_turn_items.append(item)
+            continue
+
+        for turn_idx, (start_k, end_k) in enumerate(per_turn_ranges):
+            if start_k >= end_k:
+                continue
+
+            seq_trunc = end_k + 1  # sequence space (S)
+            act_trunc = end_k      # action-dim space (S-1)
+
+            new_sequences = item.sequences[:seq_trunc].clone()
+            new_attention_mask = item.attention_mask[:seq_trunc].clone()
+
+            # Turn-specific action_mask: 1s only at this turn's positions
+            new_action_mask = torch.zeros(act_trunc, dtype=item.action_mask.dtype)
+            new_action_mask[start_k:end_k] = 1
+
+            # Helper: truncate and keep only [start_k, end_k) values
+            def trunc_mask(tensor, s=start_k, e=end_k, trunc=act_trunc):
+                if tensor is None:
+                    return None
+                result = torch.zeros(trunc, dtype=tensor.dtype)
+                result[s:e] = tensor[s:e]
+                return result
+
+            # Build info (copy non-internal keys, set total_length)
+            new_info = {}
+            for k, v in item.info.items():
+                if k.startswith("_per_turn_"):
+                    continue
+                if isinstance(v, torch.Tensor):
+                    new_info[k] = v.clone()
+                else:
+                    new_info[k] = v
+            new_info["total_length"] = torch.tensor(float(seq_trunc))
+
+            per_turn_items.append(BufferItem(
+                sequences=new_sequences,
+                action_log_probs=trunc_mask(item.action_log_probs),
+                base_action_log_probs=trunc_mask(item.base_action_log_probs),
+                rollout_log_probs=trunc_mask(item.rollout_log_probs),
+                values=trunc_mask(item.values),
+                returns=trunc_mask(item.returns),
+                advantages=trunc_mask(item.advantages),
+                attention_mask=new_attention_mask,
+                action_mask=new_action_mask,
+                info=new_info,
+            ))
+
+    return per_turn_items
+
+
 def balance_experiences(experiences, args):
     """
     Balance experience accross dp
@@ -199,6 +268,14 @@ class NaiveReplayBuffer(ABC):
             experience.to_device(torch.device("cpu"))
         items = split_experience_batch(experience)
         items = remove_padding_in_sequences(items)
+
+        # Per-turn split: if items have per-turn data, split each multi-turn
+        # BufferItem into individual per-turn BufferItems
+        if items and items[0].info.get("_per_turn_action_ranges") is not None:
+            num_before = len(items)
+            items = split_into_per_turn_items(items)
+            print(f"[Per-turn split] {num_before} trajectories -> {len(items)} per-turn items")
+
         self.items.extend(items)
         if self.limit > 0:
             samples_to_remove = len(self.items) - self.limit
