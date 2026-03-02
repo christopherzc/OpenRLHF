@@ -832,23 +832,20 @@ class RemoteExperienceMaker:
                 )
 
             if self.advantage_estimator == "gae":
-                if per_turn_ranges_list is not None:
-                    experience.advantages, experience.returns = self.get_per_turn_advantages_and_returns(
-                        experience.values,
-                        reward,
-                        experience.action_mask,
-                        per_turn_ranges_list,
-                        args.gamma,
-                        args.lambd,
-                    )
-                else:
-                    experience.advantages, experience.returns = self.get_advantages_and_returns(
-                        experience.values,
-                        reward,
-                        experience.action_mask,
-                        args.gamma,
-                        args.lambd,
-                    )
+                # Always use whole-sequence GAE even with per-turn data.
+                # Per-turn GAE kills credit assignment because only the final
+                # turn has non-zero reward (intermediate turns get 0), so ~85%
+                # of per-turn items would have zero advantages.
+                # Whole-sequence GAE propagates the final reward backward
+                # through all turns via lambda decay. The per-turn split in
+                # the replay buffer still provides batch diversity benefits.
+                experience.advantages, experience.returns = self.get_advantages_and_returns(
+                    experience.values,
+                    reward,
+                    experience.action_mask,
+                    args.gamma,
+                    args.lambd,
+                )
             elif self.advantage_estimator in ["reinforce", "rloo", "reinforce_baseline", "group_norm", "dr_grpo"]:
                 if args.gamma != 1.0 and self.advantage_estimator in [
                     "rloo",
