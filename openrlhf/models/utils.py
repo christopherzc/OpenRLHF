@@ -41,7 +41,12 @@ def compute_approx_kl(
         log_ratio = log_ratio.clamp(min=-10, max=10)
         log_ratio = log_ratio.exp() - 1 - log_ratio
 
-    log_ratio = log_ratio.clamp(min=-10, max=10)
+    # Only clamp for k1 (which can be negative and is used directly as a loss).
+    # For k2/k3 (non-negative estimators), the input clamp before exp() already
+    # prevents overflow. Clamping the OUTPUT kills the gradient once the model
+    # diverges past the threshold, removing the KL penalty's corrective force.
+    if kl_estimator == "k1":
+        log_ratio = log_ratio.clamp(min=-10, max=10)
     return log_ratio
 
 
