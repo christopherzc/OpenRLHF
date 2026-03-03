@@ -590,13 +590,11 @@ if __name__ == "__main__":
     # padded response length (~6000), NOT max_response_length (16). Use
     # generate_max_len (16) as the correct normalizer to match verl-agent's
     # gradient scale: sum(token_losses) / 16.
-    if args.verl_agent_format:
-        args.loss_agg_mode = "seq-mean-token-sum-norm"
-        args.loss_agg_norm_length = args.generate_max_len
-        print(f"[verl_agent_format] Setting loss_agg_mode='seq-mean-token-sum-norm' with norm_length={args.generate_max_len} to match verl-agent.")
-    else:
-        args.loss_agg_mode = None
-        args.loss_agg_norm_length = None
+    # NOTE: Disabled in Fix 25+26 testing — caused gradient/KL imbalance and
+    # monotonic logprobs_diff drift → collapse. Needs further investigation
+    # (possibly LR or KL coef needs rescaling to compensate).
+    args.loss_agg_mode = None
+    args.loss_agg_norm_length = None
 
     # verl-agent defaults to entropy_coeff=0.001 for exploration bonus.
     if args.verl_agent_format and args.entropy_loss_coef is None:
