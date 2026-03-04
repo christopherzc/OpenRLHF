@@ -306,16 +306,20 @@ class NaiveReplayBuffer(ABC):
         items = split_experience_batch(experience)
         items = remove_padding_in_sequences(items)
 
-        # Clean up per-turn metadata keys. These are consumed upstream by
-        # compute_advantages_and_returns() for per-turn reward placement and
-        # action-level GAE. Leaving them as ragged lists in BufferItem.info
-        # can cause downstream tensorization errors during batching/logging.
-        # Always pop unconditionally to avoid mixed-batch edge cases where
-        # only a subset of items carries the internal _per_turn_* keys.
-        for item in items:
-            item.info.pop("_per_turn_action_ranges", None)
-            item.info.pop("_per_turn_rewards", None)
-            item.info.pop("_per_turn_prompt_starts", None)
+        # Per-turn split: when per-turn metadata is present (verl_agent_format),
+        # split each multi-turn item into individual per-turn items with dense
+        # action masks and local context windows, matching verl-agent's per-step
+        # training. split_into_per_turn_items handles _per_turn_* key cleanup.
+        has_per_turn = any(
+            item.info.get("_per_turn_action_ranges") for item in items
+        )
+        if has_per_turn:
+            items = split_into_per_turn_items(items)
+        else:
+            for item in items:
+                item.info.pop("_per_turn_action_ranges", None)
+                item.info.pop("_per_turn_rewards", None)
+                item.info.pop("_per_turn_prompt_starts", None)
 
         self.items.extend(items)
         if self.limit > 0:

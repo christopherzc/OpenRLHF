@@ -852,19 +852,18 @@ class RemoteExperienceMaker:
                 )
 
             if self.advantage_estimator == "gae":
-                use_action_level_gae = (
-                    per_turn_ranges_list is not None and not getattr(args, "disable_action_level_gae", False)
-                )
-                if use_action_level_gae:
-                    # Action-level GAE: skip non-action tokens so discount only
-                    # accumulates across the ~42 action positions, not ~6000 tokens.
-                    # Standard GAE decays by 0.9025 at EVERY token position, giving
-                    # 0.9025^1000 ≈ 0 between turns. Action-level gives 0.9025^6 ≈ 0.55
-                    # between adjacent turns — matching verl-agent's per-turn signal.
-                    experience.advantages, experience.returns = self.get_action_level_advantages_and_returns(
+                if per_turn_ranges_list is not None and not getattr(args, "disable_action_level_gae", False):
+                    # Per-turn GAE: run GAE independently within each turn's
+                    # action range [start_k, end_k). No cross-turn propagation —
+                    # each turn gets its own advantage signal from value
+                    # bootstrapping (delta = reward + gamma*V[t+1] - V[t]).
+                    # This matches verl-agent's per-step training where each
+                    # step is an independent training sample.
+                    experience.advantages, experience.returns = self.get_per_turn_advantages_and_returns(
                         experience.values,
                         reward,
                         experience.action_mask,
+                        per_turn_ranges_list,
                         args.gamma,
                         args.lambd,
                     )

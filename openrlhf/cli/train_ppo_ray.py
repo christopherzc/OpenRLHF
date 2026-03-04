@@ -585,16 +585,18 @@ if __name__ == "__main__":
         print("[verl_agent_format] Overriding kl_estimator from 'k1' to 'k3' (low_var_kl) to match verl-agent defaults.")
         args.kl_estimator = "k3"
 
-    # verl-agent uses seq-mean-token-sum-norm with max_response_length as the
-    # constant divisor. With sparse action mask, loss_mask.shape[-1] is the full
-    # padded response length (~6000), NOT max_response_length (16). Use
-    # generate_max_len (16) as the correct normalizer to match verl-agent's
-    # gradient scale: sum(token_losses) / 16.
-    # NOTE: Disabled in Fix 25+26 testing — caused gradient/KL imbalance and
-    # monotonic logprobs_diff drift → collapse. Needs further investigation
-    # (possibly LR or KL coef needs rescaling to compensate).
-    args.loss_agg_mode = None
-    args.loss_agg_norm_length = None
+    # Per-step training: each per-turn item has ~6-16 dense action tokens.
+    # seq-mean-token-sum-norm with norm_length=16 matches verl-agent exactly:
+    # sum(token_losses) / max_response_length.
+    # Previously disabled (Fix 25) because full-trajectory items had sparse
+    # masks causing gradient/KL imbalance. Per-turn split (Fix 29) resolves
+    # this by making action masks dense within each per-turn item.
+    if args.verl_agent_format:
+        args.loss_agg_mode = "seq-mean-token-sum-norm"
+        args.loss_agg_norm_length = args.generate_max_len
+    else:
+        args.loss_agg_mode = None
+        args.loss_agg_norm_length = None
 
     # verl-agent defaults to entropy_coeff=0.001 for exploration bonus.
     if args.verl_agent_format and args.entropy_loss_coef is None:

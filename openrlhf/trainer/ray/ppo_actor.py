@@ -494,6 +494,37 @@ class ActorPPOTrainer(ABC):
         if self.args.entropy_loss_coef is not None:
             status["entropy_loss"] = entropy_loss.detach().item()
 
+        # === Diagnostics: advantage, entropy, gradient, and KL controller stats ===
+        # Advantage stats at action positions
+        adv_masked = advantages[experience.action_mask.bool()]
+        if adv_masked.numel() > 0:
+            status["adv_mean"] = adv_masked.mean().item()
+            status["adv_std"] = adv_masked.std().item() if adv_masked.numel() > 1 else 0.0
+            status["adv_min"] = adv_masked.min().item()
+            status["adv_max"] = adv_masked.max().item()
+            status["adv_abs_mean"] = adv_masked.abs().mean().item()
+
+        # Entropy stats at action positions (if available)
+        if self.args.entropy_loss_coef is not None:
+            ent_masked = entropy_for_loss[experience.action_mask.bool()]
+            if ent_masked.numel() > 0:
+                status["entropy_mean"] = ent_masked.mean().item()
+                status["entropy_min"] = ent_masked.min().item()
+                status["entropy_max"] = ent_masked.max().item()
+
+        # Actor gradient norm (post-clip)
+        total_norm = 0.0
+        for p in self.actor.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.float().norm(2).item() ** 2
+        status["actor_grad_norm"] = total_norm ** 0.5
+
+        # KL controller coefficient (passed in from trainer)
+        status["kl_coef"] = kl_ctl
+
+        # Number of active action tokens in this batch
+        status["num_action_tokens"] = experience.action_mask.sum().item()
+
         # merge logs from info field
         for k, v in experience.info.items():
             if isinstance(v, list):
