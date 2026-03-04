@@ -534,6 +534,108 @@ class RemoteExperienceMaker:
         self.tokenizer = tokenizer
         self.kl_ctl = kl_controller
 
+    def split_trajectories_into_turns(self, rollout_samples):
+        """Split multi-turn trajectory samples into per-turn samples.
+
+        Called BEFORE forward passes so that old_log_probs, critic values,
+        and ref log probs are computed from the same per-turn context that
+        training will use. This eliminates the PPO ratio mismatch that
+        caused Fix 29's loss explosion.
+
+        Each per-turn Experience has:
+        - sequences: local window [prompt_start_k, end_k + 1)
+        - action_mask: length seq_len - 1, dense for this turn's response
+        - rewards: scalar for this turn
+        - rollout_log_probs: None (vLLM log probs use full trajectory context)
+        """
+        per_turn_samples = []
+
+        for sample in rollout_samples:
+            ranges_wrapped = sample.info.get("_per_turn_action_ranges")
+            if not ranges_wrapped or not ranges_wrapped[0]:
+                # No per-turn data — pass through as-is
+                per_turn_samples.append(sample)
+                continue
+
+            # Unwrap the extra list layer added for concat_experiences merging
+            ranges = ranges_wrapped[0]  # list of (start_k, end_k) tuples
+            rewards_wrapped = sample.info.get("_per_turn_rewards")
+            rewards = rewards_wrapped[0] if rewards_wrapped else []
+            prompt_starts_wrapped = sample.info.get("_per_turn_prompt_starts")
+            prompt_starts = prompt_starts_wrapped[0] if prompt_starts_wrapped else []
+
+            # Collect trajectory-level info keys (skip internal _per_turn_* keys)
+            extra_info = {}
+            for k, v in sample.info.items():
+                if k.startswith("_per_turn_"):
+                    continue
+                if isinstance(v, torch.Tensor):
+                    extra_info[k] = v.clone()
+                else:
+                    extra_info[k] = v
+
+            for turn_idx, (start_k, end_k) in enumerate(ranges):
+                if start_k >= end_k:
+                    continue
+
+                prompt_start = int(prompt_starts[turn_idx]) if turn_idx < len(prompt_starts) else 0
+                prompt_start = max(0, prompt_start)
+
+                seq_start = prompt_start
+                seq_end = end_k + 1  # exclusive, sequence-token space
+                if seq_start >= seq_end:
+                    continue
+
+                # Action tensor coordinates (length = seq_len - 1)
+                act_len = seq_end - seq_start - 1
+                local_start = start_k - prompt_start
+                local_end = end_k - prompt_start
+                if not (0 <= local_start < local_end <= act_len):
+                    continue
+
+                # Slice sequences and attention mask to local window
+                turn_seq = sample.sequences[:, seq_start:seq_end]
+                turn_attn = sample.attention_mask[:, seq_start:seq_end]
+
+                # Dense action mask for this turn's response tokens
+                turn_action_mask = torch.zeros(
+                    1, act_len,
+                    dtype=sample.action_mask.dtype,
+                    device=sample.action_mask.device,
+                )
+                turn_action_mask[0, local_start:local_end] = 1
+
+                # Scalar reward for this turn
+                turn_reward = rewards[turn_idx] if turn_idx < len(rewards) else 0.0
+
+                # Build info with consistent keys for concat_experiences
+                turn_info = {}
+                for k, v in extra_info.items():
+                    if isinstance(v, torch.Tensor):
+                        turn_info[k] = v.clone()
+                    else:
+                        turn_info[k] = v
+                turn_info["response_length"] = torch.tensor([float(turn_action_mask.sum().item())])
+                turn_info["total_length"] = torch.tensor([float(seq_end - seq_start)])
+
+                per_turn_samples.append(Experience(
+                    sequences=turn_seq,
+                    attention_mask=turn_attn,
+                    action_mask=turn_action_mask,
+                    rollout_log_probs=None,  # vLLM log probs use wrong context
+                    prompts=sample.prompts,
+                    labels=sample.labels,
+                    rewards=torch.tensor([turn_reward]),
+                    scores=torch.tensor([turn_reward]),
+                    info=turn_info,
+                ))
+
+        logger.info(
+            f"[Per-turn split] {len(rollout_samples)} trajectories → "
+            f"{len(per_turn_samples)} per-turn items"
+        )
+        return per_turn_samples
+
     def split_rollout_samples(self, rollout_samples):
         for i, sample in enumerate(rollout_samples):
             sample.index = [i]
@@ -578,6 +680,11 @@ class RemoteExperienceMaker:
         Then, if we need certain processing for the rewards or do certain filtering, we can process the rollout as a whole.
         After that, we will calculate the advantages and returns for each experience.
         """
+        # Split multi-turn trajectories into per-turn items BEFORE forward passes
+        # so old_log_probs are computed from per-turn context (matching training).
+        if getattr(self.strategy.args, "verl_agent_format", False):
+            rollout_samples = self.split_trajectories_into_turns(rollout_samples)
+
         # Each batch of samples will be scheduled to a effective Ray Actor (i.e, a DP rank)
         samples_list = self.split_rollout_samples(rollout_samples)
 
