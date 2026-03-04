@@ -2,6 +2,7 @@ import math
 import random
 from abc import ABC
 from dataclasses import dataclass, fields
+from itertools import zip_longest
 from typing import List, Optional
 
 import torch
@@ -129,111 +130,6 @@ def remove_padding_in_sequences(items):
     return items
 
 
-def split_into_per_turn_items(items: List[BufferItem]) -> List[BufferItem]:
-    """Split multi-turn BufferItems into per-turn BufferItems.
-
-    For turn k with:
-    - action range [start_k, end_k) in action-token space (S-1)
-    - prompt start p_k in sequence-token space (S)
-
-    Build a local turn window:
-    - sequences / attention_mask: [p_k, end_k + 1)
-    - action tensors: [p_k, end_k), rebased to local coordinates
-    - action_mask: 1s only on this turn's local action span
-
-    This aligns training context with verl-agent format where each decision is
-    trained against its own turn prompt, not a cumulative trajectory prefix.
-    """
-    per_turn_items = []
-
-    for item in items:
-        per_turn_ranges = item.info.get("_per_turn_action_ranges", None)
-        per_turn_prompt_starts = item.info.get("_per_turn_prompt_starts", None)
-
-        if per_turn_ranges is None or not per_turn_ranges:
-            # No per-turn data — keep item as-is, clean up internal keys
-            item.info.pop("_per_turn_action_ranges", None)
-            item.info.pop("_per_turn_rewards", None)
-            item.info.pop("_per_turn_prompt_starts", None)
-            per_turn_items.append(item)
-            continue
-
-        for turn_idx, (start_k, end_k) in enumerate(per_turn_ranges):
-            if start_k >= end_k:
-                continue
-
-            if per_turn_prompt_starts is not None and turn_idx < len(per_turn_prompt_starts):
-                prompt_start_seq = int(per_turn_prompt_starts[turn_idx])
-            else:
-                prompt_start_seq = 0
-            prompt_start_seq = max(0, prompt_start_seq)
-
-            seq_start = prompt_start_seq
-            seq_end = end_k + 1  # exclusive, sequence-token space
-            if seq_start >= seq_end:
-                continue
-
-            act_start = prompt_start_seq  # action-token space, aligned with seq_start
-            act_end = end_k                            # exclusive
-            if act_start >= act_end:
-                continue
-
-            local_start = start_k - act_start
-            local_end = end_k - act_start
-            if not (0 <= local_start < local_end <= (act_end - act_start)):
-                continue
-
-            new_sequences = item.sequences[seq_start:seq_end].clone()
-            new_attention_mask = item.attention_mask[seq_start:seq_end].clone()
-
-            new_action_mask = torch.zeros(
-                act_end - act_start,
-                dtype=item.action_mask.dtype,
-                device=item.action_mask.device,
-            )
-            new_action_mask[local_start:local_end] = 1
-
-            # Helper: window action tensors and zero out off-turn positions.
-            def trunc_mask(tensor):
-                if tensor is None:
-                    return None
-                result = torch.zeros(
-                    act_end - act_start,
-                    dtype=tensor.dtype,
-                    device=tensor.device,
-                )
-                window = tensor[act_start:act_end]
-                result[local_start:local_end] = window[local_start:local_end]
-                return result
-
-            # Build info (copy non-internal keys, set local lengths)
-            new_info = {}
-            for k, v in item.info.items():
-                if k.startswith("_per_turn_"):
-                    continue
-                if isinstance(v, torch.Tensor):
-                    new_info[k] = v.clone()
-                else:
-                    new_info[k] = v
-            new_info["total_length"] = torch.tensor(float(seq_end - seq_start))
-            new_info["response_length"] = torch.tensor(float(new_action_mask.sum().item()))
-
-            per_turn_items.append(BufferItem(
-                sequences=new_sequences,
-                action_log_probs=trunc_mask(item.action_log_probs),
-                base_action_log_probs=trunc_mask(item.base_action_log_probs),
-                rollout_log_probs=trunc_mask(item.rollout_log_probs),
-                values=trunc_mask(item.values),
-                returns=trunc_mask(item.returns),
-                advantages=trunc_mask(item.advantages),
-                attention_mask=new_attention_mask,
-                action_mask=new_action_mask,
-                info=new_info,
-            ))
-
-    return per_turn_items
-
-
 def balance_experiences(experiences, args):
     """
     Balance experience accross dp
@@ -265,7 +161,13 @@ def balance_experiences(experiences, args):
     if len(last_half) > len(first_half):
         interval_items.append(last_half[0])
 
-    interval_merged = list(zip(*interval_items))
+    # Use zip_longest to avoid truncation when item count isn't divisible by effective_num.
+    # The last chunk may be shorter, causing zip() to drop an entire group.
+    interval_merged = [
+        [item for item in group if item is not None]
+        for group in zip_longest(*interval_items, fillvalue=None)
+    ]
+    interval_merged = [group for group in interval_merged if group]
     return [make_experience_batch(items) for items in interval_merged]
 
 

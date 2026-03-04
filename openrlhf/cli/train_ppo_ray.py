@@ -603,6 +603,22 @@ if __name__ == "__main__":
         args.entropy_loss_coef = 0.001
         print(f"[verl_agent_format] Setting entropy_loss_coef=0.001 to match verl-agent defaults.")
 
+    # Guard: per-turn splitting changes total item count, breaking the
+    # n_samples_per_prompt reshape in compute_advantages_and_returns.
+    if args.verl_agent_format and args.n_samples_per_prompt > 1:
+        raise ValueError(
+            "--verl_agent_format is incompatible with --n_samples_per_prompt > 1. "
+            "Per-turn splitting changes the total item count, breaking reward reshaping."
+        )
+
+    # Guard: per-turn items set rollout_log_probs=None (vLLM log probs use
+    # full trajectory context). IS correction would crash computing ratio.
+    if args.verl_agent_format and getattr(args, "enable_vllm_is_correction", False):
+        raise ValueError(
+            "--verl_agent_format is incompatible with --enable_vllm_is_correction. "
+            "Per-turn items have no rollout_log_probs."
+        )
+
     # Set vLLM generate_batch_size to rollout_batch_size if not specified
     if not args.vllm_generate_batch_size:
         args.vllm_generate_batch_size = args.rollout_batch_size
