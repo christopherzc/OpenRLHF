@@ -138,7 +138,7 @@ def split_into_per_turn_items(items: List[BufferItem]) -> List[BufferItem]:
 
     Build a local turn window:
     - sequences / attention_mask: [p_k, end_k + 1)
-    - action tensors: [p_k - 1, end_k), rebased to local coordinates
+    - action tensors: [p_k, end_k), rebased to local coordinates
     - action_mask: 1s only on this turn's local action span
 
     This aligns training context with verl-agent format where each decision is
@@ -173,7 +173,7 @@ def split_into_per_turn_items(items: List[BufferItem]) -> List[BufferItem]:
             if seq_start >= seq_end:
                 continue
 
-            act_start = max(0, prompt_start_seq - 1)  # action-token space
+            act_start = prompt_start_seq  # action-token space, aligned with seq_start
             act_end = end_k                            # exclusive
             if act_start >= act_end:
                 continue
