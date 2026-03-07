@@ -102,7 +102,7 @@ class LLMRayActor:
 
             os.environ["RAY_ADDRESS"] = global_worker.gcs_client.address
 
-        os.environ["VLLM_USE_V1"] = "1"
+        os.environ.setdefault("VLLM_USE_V1", "1")
 
     async def init_process_group(
         self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray
@@ -263,11 +263,17 @@ def create_vllm_engines(
                 "0.10.0"
             ), "vLLM > 0.10.0 is required for logprobs_mode"
 
+        # Propagate VLLM env vars to Ray actors (they don't inherit the launcher's env).
+        # VLLM_USE_V1=0 is critical when the container lacks SYS_PTRACE (pidfd_getfd).
+        vllm_env_vars = {k: v for k, v in os.environ.items() if k.startswith("VLLM_")}
+        runtime_env = {"env_vars": vllm_env_vars} if vllm_env_vars else {}
+
         vllm_engines.append(
             LLMRayActor.options(
                 num_cpus=num_gpus,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
+                runtime_env=runtime_env,
             ).remote(**actor_kwargs)
         )
 
