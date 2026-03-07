@@ -622,6 +622,11 @@ class ActorPPOTrainer(ABC):
 @ray.remote(num_gpus=1)
 class PolicyModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
+        # Allow vLLM EngineCore subprocesses to access our CUDA IPC handles
+        # via pidfd_getfd (needed when container lacks SYS_PTRACE).
+        from openrlhf.trainer.ray.utils import allow_subprocess_ptrace
+        allow_subprocess_ptrace()
+
         args = strategy.args
         self.save_hf_ckpt = args.save_hf_ckpt
         self.disable_ds_ckpt = args.disable_ds_ckpt

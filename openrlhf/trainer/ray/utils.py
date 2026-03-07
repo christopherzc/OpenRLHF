@@ -46,3 +46,35 @@ def get_physical_gpu_id():
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
     return str(props.uuid)
+
+
+def allow_subprocess_ptrace():
+    """Allow child processes to access this process's file descriptors via pidfd_getfd.
+
+    vLLM V1 runs EngineCore in a subprocess. CUDA IPC weight sync shares GPU memory
+    handles across the process boundary using pidfd_getfd, which requires either the
+    SYS_PTRACE capability or PR_SET_PTRACER permission on the target process.
+    Most container runtimes don't grant SYS_PTRACE, so we call
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) to allow any process to access our FDs.
+
+    Must be called in the process that creates CUDA IPC handles (PolicyModelActor)
+    AND in the process that hosts vLLM (LLMRayActor).
+    """
+    import ctypes
+    import ctypes.util
+    import logging
+    import sys
+
+    if sys.platform != "linux":
+        return
+
+    PR_SET_PTRACER = 0x59616D61
+    PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    result = libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+    if result != 0:
+        logging.getLogger(__name__).warning(
+            "prctl(PR_SET_PTRACER) failed (errno=%d). "
+            "CUDA IPC weight sync may fail with pidfd_getfd errors.",
+            ctypes.get_errno(),
+        )
