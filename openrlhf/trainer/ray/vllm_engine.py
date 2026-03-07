@@ -45,6 +45,10 @@ class LLMRayActor:
         verl_agent_format: bool = False,
         **kwargs,
     ):
+        # Allow vLLM's EngineCore subprocess to access this process's CUDA
+        # IPC handles via pidfd_getfd, even without SYS_PTRACE capability.
+        self._allow_subprocess_ptrace()
+
         self._configure_device_env(
             backend=kwargs.get("distributed_executor_backend"),
             bundle_indices=bundle_indices,
@@ -65,6 +69,31 @@ class LLMRayActor:
         engine_args = vllm.AsyncEngineArgs(*args, **self.kwargs)
         self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
         await self.llm.is_sleeping()
+
+    @staticmethod
+    def _allow_subprocess_ptrace():
+        """Allow child processes to ptrace this process.
+
+        vLLM V1 runs EngineCore in a subprocess. CUDA IPC weight sync uses
+        pidfd_getfd to share GPU memory handles across this boundary, which
+        requires either SYS_PTRACE capability or PR_SET_PTRACER permission.
+        Most container runtimes don't grant SYS_PTRACE, so we set
+        PR_SET_PTRACER to allow any child to access our file descriptors.
+        """
+        import ctypes
+        import ctypes.util
+
+        PR_SET_PTRACER = 0x59616D61
+        PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        result = libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+        if result != 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                "prctl(PR_SET_PTRACER) failed (errno=%d). "
+                "CUDA IPC weight sync may fail with pidfd_getfd errors.",
+                ctypes.get_errno(),
+            )
 
     def _configure_device_env(self, backend, bundle_indices, num_gpus):
         if backend == "ray":
@@ -103,10 +132,6 @@ class LLMRayActor:
             os.environ["RAY_ADDRESS"] = global_worker.gcs_client.address
 
         os.environ.setdefault("VLLM_USE_V1", "1")
-        # Disable V1 multiprocessing so EngineCore runs in-process.
-        # Without this, V1 spawns a subprocess that requires pidfd_getfd
-        # (SYS_PTRACE capability) for CUDA IPC weight sync.
-        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     async def init_process_group(
         self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray
