@@ -368,17 +368,18 @@ class PPOTrainer(BasePPOTrainer):
         # Generate samples and calculate rewards
         samples_list = self.samples_generator.generate_eval_samples(**generate_kwargs)
 
-        # duplicate prompts and labels for each sample
-        all_prompts = sum([s.prompts for s in samples_list], [])
-
         n_samples_per_prompt = generate_kwargs["n_samples_per_prompt"]
 
-        # Get rewards from samples, such as agent rewards or remote reward models
-        rewards_list = []
-        for samples in samples_list:
-            rewards_list.append(samples.rewards)
-        # Reshape rewards to (num_prompts, n_samples_per_prompt)
-        rewards = torch.tensor(rewards_list).reshape(-1, n_samples_per_prompt)
+        # Filter out samples with None rewards (failed prompts).
+        valid_samples = [s for s in samples_list if s.rewards is not None]
+        if not valid_samples:
+            logger.warning("Evaluation produced no rewards — skipping metric computation.")
+            return
+
+        all_prompts = sum([s.prompts for s in valid_samples], [])
+
+        # Each sample.rewards is a 1-element tensor; cat and reshape to (num_prompts, n_samples_per_prompt).
+        rewards = torch.cat([s.rewards for s in valid_samples]).reshape(-1, n_samples_per_prompt)
 
         # Collect local statistics for each data source
         global_metrics = {}  # {datasource: {"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}}

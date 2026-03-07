@@ -174,7 +174,10 @@ class LLMRayActor:
             self.executor.execute(
                 prompt=prompt,
                 label=label,
-                sampling_params=sampling_params,
+                # Each task gets its own copy — the agent executor mutates
+                # sampling_params.max_tokens in its multi-turn loop, and
+                # asyncio interleaving can cause tasks to see stale values.
+                sampling_params=deepcopy(sampling_params) if num_samples > 1 else sampling_params,
                 max_length=max_length,
                 hf_tokenizer=hf_tokenizer,
                 llm_engine=self,

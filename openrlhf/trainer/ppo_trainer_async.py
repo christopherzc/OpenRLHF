@@ -31,7 +31,7 @@ class VLLMLock:
         self._lock.release()
 
 
-@ray.remote
+@ray.remote(max_concurrency=2)
 class GenerateSamplesActor:
     def __init__(
         self,
@@ -99,10 +99,15 @@ class GenerateSamplesActor:
         finally:
             ray.get(self.vllm_lock.release.remote())
 
-        # Compute pass@k and pass@1 metrics
-        all_prompts = sum([s.prompts for s in samples_list], [])
-        rewards_list = [s.rewards for s in samples_list]
-        rewards = torch.tensor(rewards_list).reshape(-1, n_samples_per_prompt)
+        # Compute pass@k and pass@1 metrics.
+        # Filter out samples with None rewards (failed prompts).
+        valid_samples = [s for s in samples_list if s.rewards is not None]
+        if not valid_samples:
+            logger.warning("Evaluation produced no rewards — skipping metric computation.")
+            return {}
+
+        all_prompts = sum([s.prompts for s in valid_samples], [])
+        rewards = torch.cat([s.rewards for s in valid_samples]).reshape(-1, n_samples_per_prompt)
 
         global_metrics = {}
         num_prompts = len(all_prompts) // n_samples_per_prompt

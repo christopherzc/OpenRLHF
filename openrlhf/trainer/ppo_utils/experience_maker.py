@@ -248,7 +248,7 @@ class SamplesGenerator:
         self.eval_dataloader = eval_dataloader
 
     @torch.no_grad()
-    def generate_eval_samples(self, **generate_kwargs) -> Tuple[List[Experience], Optional[float], int, bool]:
+    def generate_eval_samples(self, **generate_kwargs) -> List[Experience]:
         if getattr(self, "_eval_dataloader_iter", None) is None:
             self._eval_dataloader_iter = iter(self.eval_dataloader)
 
@@ -379,11 +379,12 @@ class SamplesGenerator:
         heapq.heapify(engine_heap)
 
         # Pre-compute engine assignment to keep loads even.
+        n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.n_samples_per_prompt)
         engine_indices = []
         for _ in prompts:
             current_load, engine_idx = heapq.heappop(engine_heap)
             engine_indices.append(engine_idx)
-            heapq.heappush(engine_heap, (current_load + self.args.n_samples_per_prompt, engine_idx))
+            heapq.heappush(engine_heap, (current_load + n_samples, engine_idx))
 
         refs = []
         for idx, (prompt, label) in enumerate(zip(prompts, labels)):
@@ -395,7 +396,7 @@ class SamplesGenerator:
                 sampling_params=sampling_params,
                 max_length=truncate_length,
                 hf_tokenizer=self.tokenizer,
-                num_samples=self.args.n_samples_per_prompt,
+                num_samples=n_samples,
             )
             refs.append(ref)
 
