@@ -419,4 +419,5 @@ class PPOTrainer(BasePPOTrainer):
         end_time = time.time()
         duration = end_time - start_time
         time_str = str(timedelta(seconds=duration)).split(".")[0]
-        logger.info(f"✨ Evaluation completed in {time_str}, global_step {global_step}, eval_metrics: {logs}")
+        logs["eval_duration"] = duration
+        logger.info(f"[EVAL] Global step {global_step}: {logs}")

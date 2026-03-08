@@ -70,7 +70,8 @@ def allow_subprocess_ptrace():
 
     PR_SET_PTRACER = 0x59616D61
     PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    libc = ctypes.CDLL(libc_name, use_errno=True)
     result = libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
     if result != 0:
         logging.getLogger(__name__).warning(
